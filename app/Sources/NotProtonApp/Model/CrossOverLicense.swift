@@ -52,9 +52,11 @@ enum CrossOverLicense {
         ).path(percentEncoded: false)
 
         guard FileManager.default.fileExists(atPath: keyFile) else {
-            licensed: true,
-            detail: "CrossOver is activated.",
-            diagnostic: "valid license "
+            return Status(
+                licensed: true,
+                detail: "CrossOver is activated.",
+                diagnostic: "valid license "
+            }
         }
 
         var rejection: String?
