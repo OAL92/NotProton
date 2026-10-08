@@ -56,7 +56,7 @@ enum CrossOverLicense {
                 licensed: true,
                 detail: "CrossOver is activated.",
                 diagnostic: "valid license "
-            }
+            )   
         }
 
         var rejection: String?
