@@ -322,19 +322,6 @@ struct FailureReportTests {
     }
 }
 
-// A user who activates CrossOver after a refresh, then presses the button that was turned
-// down, gets the same refusal from a verdict that is no longer true.
-@MainActor
-@Suite("License freshness")
-struct LicenseFreshnessTests {
-
-    private func scratch() -> URL {
-        let dir = URL(filePath: NSTemporaryDirectory())
-            .appending(path: "np-license-\(UUID().uuidString)")
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir
-    }
-
     // A bundle with no tie.pub in it, which the check turns down without reading any
     // license file, so the verdict does not depend on what this machine is activated for.
     private func snapshot(
