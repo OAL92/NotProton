@@ -387,7 +387,7 @@ struct FailureReportTests {
 
         #expect(await status.checkLicense() == nil)
     }
-}
+
 
 // Four entry points share one answer here. The menu items used to skip it: Install dropped
 // the tool without saying so, and Set Up hit the refusal inside RunnerSetup as a failed step.
