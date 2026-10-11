@@ -107,10 +107,12 @@ enum RunnerInstaller {
     }
 
     static func removePrefixTemplates(
-        keeping builds: Set<String>, libraries: [SteamLibrary], reportBusy: Bool = true
+        keeping builds: Set<String>, libraries: [SteamLibrary], reportBusy: Bool = true,
+        removingFolder: Bool = false
     ) -> [StepFailure] {
         var failures: [StepFailure] = []
         for library in libraries {
+            let earlierFailures = failures.count
             let kept = Set(builds.flatMap {
                 SupportPaths.prefixTemplates(forBuild: $0, in: library).map(\.lastPathComponent)
             })
@@ -129,7 +131,7 @@ enum RunnerInstaller {
                 }
                 let lock = openat(parent, ".notproton-template.lock", O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
                 guard lock >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-                defer { close(lock) }
+                defer { FileLock.release(lock) }
                 var lockInfo = stat()
                 guard fstat(lock, &lockInfo) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
                 guard lockInfo.st_mode & S_IFMT == S_IFREG else { throw POSIXError(.EINVAL) }
@@ -159,6 +161,9 @@ enum RunnerInstaller {
                             detail: "Could not remove prefix template \(folder.appending(path: name).path(percentEncoded: false)): \(error.localizedDescription) Refresh to retry."
                         ))
                     }
+                }
+                if removingFolder, builds.isEmpty, failures.count == earlierFailures {
+                    unlinkat(parent, SupportPaths.prefixTemplateFolder, AT_REMOVEDIR)
                 }
             } catch {
                 failures.append(StepFailure(

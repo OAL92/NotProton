@@ -30,11 +30,30 @@ struct RunnerBuild: Sendable, Equatable, Identifiable {
 
     var tools: [CompatTool] = []
 
+    var rebuilds: [RunnerRebuild] = []
+
     var id: String { flavor.map { "\(bundleVersion)-\($0)" } ?? bundleVersion }
+
+    func matching(loaderSHA256 hash: String) -> RunnerBuild? {
+        if hash == loaderSHA256 { return self }
+        guard let rebuild = rebuilds.first(where: { $0.loaderSHA256 == hash }) else { return nil }
+        return RunnerBuild(
+            bundleVersion: bundleVersion, releaseVersion: releaseVersion, flavor: flavor,
+            loaderSHA256: rebuild.loaderSHA256, cleanNtdll: rebuild.cleanNtdll,
+            patchedNtdll: rebuild.patchedNtdll, tools: tools, rebuilds: rebuilds
+        )
+    }
 
     var flavorName: String { flavor?.uppercased() ?? "Rosetta" }
 
     var displayVersion: String { "\(releaseVersion) \(flavorName)" }
+}
+
+// The version of CrossOver offered in China has different hashes but is identical in the ways that matter
+struct RunnerRebuild: Sendable, Equatable {
+    let loaderSHA256: String
+    let cleanNtdll: [WineArch: String]
+    let patchedNtdll: [WineArch: String]
 }
 
 struct CompatTool: Sendable, Hashable, Identifiable {
@@ -44,6 +63,11 @@ struct CompatTool: Sendable, Hashable, Identifiable {
 
         var name: String { self == .fex ? "FEX" : "Rosetta" }
         var unixDir: String { self == .fex ? "aarch64-unix" : "x86_64-unix" }
+
+        // CrossOver's FEX build needs Tahoe. Its Rosetta tool runs on Sequoia.
+        static let fexAvailable = ProcessInfo.processInfo.isOperatingSystemAtLeast(
+            OperatingSystemVersion(majorVersion: 26, minorVersion: 0, patchVersion: 0)
+        )
     }
 
     let name: String
@@ -82,7 +106,10 @@ enum SupportedRunners {
         case nobody
     }
 
-    static func tools(for builds: [RunnerBuild], legacy: LegacyHolder = .nobody) -> [InstalledTool] {
+    static func tools(
+        for builds: [RunnerBuild], legacy: LegacyHolder = .nobody,
+        fexAvailable: Bool = CompatTool.Flavor.fexAvailable, keeping kept: Set<String> = []
+    ) -> [InstalledTool] {
         let installed = Set(builds.map(\.id))
         let holder: String? = switch legacy {
         case .build(let id): id
@@ -95,7 +122,7 @@ enum SupportedRunners {
                     tool: CompatTool(name: name, flavor: tool.flavor, display: tool.display), build: build.id
                 )
             }
-        }
+        }.filter { $0.tool.flavor != .fex || fexAvailable || kept.contains($0.name) }
         func rank(_ tool: InstalledTool) -> Int {
             toolPreference.firstIndex(of: tool.name) ?? toolPreference.count
         }
@@ -120,6 +147,20 @@ enum SupportedRunners {
             ],
             tools: [
                 CompatTool(name: "notproton-26.3", flavor: .rosetta, display: "CrossOver 26.3"),
+            ],
+            rebuilds: [
+                // crossoverchina.com
+                RunnerRebuild(
+                    loaderSHA256: "35aeb1a75a48f3b053dbf2395deac33c530a0b0b7db0bc6357362348af9514ce",
+                    cleanNtdll: [
+                        .x86_64Windows: "1c4799bb3769ba1392c2298e4904ce0b080f040940b2a273f4eaa0906b231a93",
+                        .i386Windows: "21e7d0a6d6868f1853489f5a9798e706509a20a65ee370f50b37ab7b1cdcaae3",
+                    ],
+                    patchedNtdll: [
+                        .x86_64Windows: "3725117cc103acd9d2713535e41733563f340e27604e1abdea5afbdc2c2be65a",
+                        .i386Windows: "6d9ef05089fea07d1f4cbebe27df1f9a92dbc8eb245033db9f5e40a943175d5b",
+                    ]
+                ),
             ]
         ),
         RunnerBuild(
@@ -199,7 +240,7 @@ enum SupportedRunners {
     ]
 
     static func build(loaderSHA256 hash: String) -> RunnerBuild? {
-        all.first { $0.loaderSHA256 == hash }
+        all.lazy.compactMap { $0.matching(loaderSHA256: hash) }.first
     }
 
     static func build(id: String) -> RunnerBuild? {

@@ -58,6 +58,7 @@ enum SteamInstaller {
         app: URL = SupportPaths.Steam.app,
         bridge: URL = SupportPaths.bridge,
         signatures: URL = SupportPaths.signatures,
+        fonts: URL = SupportPaths.fonts,
         overlayShim: URL = SupportPaths.overlayShim,
         iconmaker: URL = SupportPaths.iconmaker,
         appinfo: URL = SupportPaths.appinfo,
@@ -86,7 +87,7 @@ enum SteamInstaller {
         try assertBundleIsPresent(app)
         try assertInsertIsDeployedOrAbsent(at: plist, dylib: dylib)
         let installationLock = holdingInstallationLock ? -1 : try DeploymentContent.acquireInstallationLock(for: app)
-        defer { if installationLock >= 0 { close(installationLock) } }
+        defer { if installationLock >= 0 { FileLock.release(installationLock) } }
         guard let dylibHashes = try MachOBuild.hashesIgnoringSignature(of: payload.dylib) else {
             throw StepFailure(step: step, detail: "The bundled NotProton dylib is invalid.")
         }
@@ -99,7 +100,7 @@ enum SteamInstaller {
         let tools = CompatToolList.installed(runners: runners, file: support.appending(path: "tools"))
         let files = DeploymentContent.files(
             payload: payload, bridgePayload: bridgeLocated, app: app, bridge: bridge,
-            signatures: signatures, overlayShim: overlayShim, iconmaker: iconmaker, appinfo: appinfo,
+            signatures: signatures, fonts: fonts, overlayShim: overlayShim, iconmaker: iconmaker, appinfo: appinfo,
             compatTools: compatTools, tools: tools, runners: runners)
         let content = try DeploymentContent.inspect(files: files, bundled: build, installed: previousBuild,
                                                    legacyVersion: SteamBundle.deployedVersion(at: deployedVersion))
@@ -118,7 +119,7 @@ enum SteamInstaller {
         }
         let patching = try needsPatching(plist: plist, dylib: dylib, shipping: payload.dylib, app: app)
         let replacingFiles = try files.contains {
-            try !$0.matches() && FileManager.default.fileExists(atPath: $0.destination.path(percentEncoded: false))
+            try $0.needsClientStopped && !$0.matches() && FileManager.default.fileExists(atPath: $0.destination.path(percentEncoded: false))
         }
         let pinned = try DeploymentContent.pinnedFiles(bridge: bridge, runners: runners)
         let existingAccount = previousBuild != nil || SteamBundle.deployedVersion(at: deployedVersion) != nil
@@ -149,6 +150,7 @@ enum SteamInstaller {
         for file in files where file.destination != dylib {
             try installIfChanged(file)
         }
+        try removeStaleFonts(in: fonts, keeping: payload.fonts)
 
         var backedUp = false
         if patching {
@@ -214,6 +216,19 @@ enum SteamInstaller {
         try write(outcome.version, to: deployedVersion)
         try atomicReplace(DeploymentContent.record(beside: deployedVersion),
                           with: JSONEncoder().encode(outcome.build), step: step)
+    }
+
+    static func removeStaleFonts(in fonts: URL, keeping shipped: [String]) throws {
+        let files = FileManager.default
+        let keep = Set(shipped)
+        for rel in files.subpaths(atPath: fonts.path(percentEncoded: false)) ?? [] where !keep.contains(rel) {
+            let url = fonts.appending(path: rel)
+            var isDirectory: ObjCBool = false
+            if files.fileExists(atPath: url.path(percentEncoded: false), isDirectory: &isDirectory), isDirectory.boolValue {
+                continue
+            }
+            try WriteRefused.catching(url) { try files.removeItem(at: url) }
+        }
     }
 
     static func installIfChanged(_ file: DeploymentContent.File) throws {
@@ -340,13 +355,41 @@ enum SteamInstaller {
 
     static func adHocSign(_ url: URL, step: String = step) throws {
         let path = url.path(percentEncoded: false)
-        let result = try Shell.run("/usr/bin/codesign", ["-f", "-s", "-", path])
+        var result = try Shell.run("/usr/bin/codesign", ["-f", "-s", "-", path])
+        // Fixes codesign refusing a Steam.app that carries Finder info or a resource fork.
+        if !result.succeeded, result.stderr.contains("detritus not allowed") {
+            clearFinderData(in: enclosingBundle(of: url))
+            result = try Shell.run("/usr/bin/codesign", ["-f", "-s", "-", path])
+        }
         guard result.succeeded else {
             throw StepFailure(
                 step: step,
                 detail: "\(path) could not be signed. "
                     + result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
             )
+        }
+    }
+
+    static func enclosingBundle(of url: URL) -> URL {
+        var candidate = url
+        while candidate.pathComponents.count > 1 {
+            if candidate.pathExtension == "app" { return candidate }
+            candidate = candidate.deletingLastPathComponent()
+        }
+        return url
+    }
+
+    static func clearFinderData(in root: URL) {
+        var paths = [root.path(percentEncoded: false)]
+        if let walk = FileManager.default.enumerator(atPath: paths[0]) {
+            while let relative = walk.nextObject() as? String {
+                paths.append(root.appending(path: relative).path(percentEncoded: false))
+            }
+        }
+        for path in paths {
+            for name in ["com.apple.FinderInfo", "com.apple.ResourceFork"] {
+                removexattr(path, name, XATTR_NOFOLLOW)
+            }
         }
     }
 
