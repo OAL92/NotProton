@@ -94,13 +94,8 @@ enum CrossOverLicense {
                 if result.succeeded {
                     return Status(
                         licensed: true,
-<<<<<<< HEAD
                         detail: String(localized: "CrossOver is activated."),
                         diagnostic: "valid license in \(label)"
-=======
-                        detail: "CrossOver is activated.",
-                        diagnostic: "valid license "
->>>>>>> 9ae6357 (Update license verification to always indicate activation for testing purposes)
                     )
                 }
 
