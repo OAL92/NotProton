@@ -35,10 +35,12 @@ SRCS := \
 	dylib/hooks/hook_compat.c \
 	dylib/hooks/hook_shortcut.c \
 	dylib/hooks/hook_icon.c \
+	dylib/hooks/hook_shortcut_bundle.c \
 	dylib/hooks/hook_webui.c \
 	dylib/hooks/hook_webpatch.c \
 	dylib/hooks/hook_spawn.c \
 	dylib/hooks/hook_launch.c \
+	dylib/hooks/hook_activate.c \
 	dylib/feats/compat.c \
 	dylib/feats/webui.c \
 	dylib/feats/compatsvc.c \
@@ -66,7 +68,7 @@ DEPS := $(OBJS:.o=.d)
         tests-list overlay-shim overlay-shim-install overlay-shim-tests \
         overlay-shim-bench iconmaker icon \
         appinfo helpers-install ntdll-resolve bridge runcheck compatcheck \
-        compatsvc-check scriptcheck envcheck buildcheck settingscheck routecheck bridgecheck gamedrivecheck launchercheck launch-shell FORCE
+        compatsvc-check shortcutcheck scriptcheck envcheck buildcheck settingscheck routecheck bridgecheck gamedrivecheck launchercheck launch-shell activatecheck FORCE
 
 APP_PAYLOAD := app/Sources/NotProtonApp/Resources/payload
 
@@ -134,7 +136,7 @@ mincheck:
 l10ncheck:
 	@bin=$$(swift build --package-path app -c release --show-bin-path); \
 	python3 dylib/tests/l10ncheck.py app/Sources/NotProtonApp/Resources/Localization/Localizable.xcstrings \
-		"$$bin/../../Intermediates.noindex/NotProtonApp.build/$$(basename "$$bin")" zh-Hans
+		"$$bin/../../Intermediates.noindex/NotProtonApp.build/$$(basename "$$bin")" zh-Hans it
 
 # runcheck owns compat_run.sh, whose warnings wait for a change that can move
 # the embedded __text baseline
@@ -166,6 +168,18 @@ compatsvc-check:
 	mkdir -p $(OUT_DIR) && \
 	$(TEST_CC) -o $(COMPATSVC_CHECK) dylib/tests/compatsvc-check.c && \
 	$(COMPATSVC_CHECK)
+
+SHORTCUT_BUNDLE_CHECK := $(OUT_DIR)/shortcut-bundle-check
+SHORTCUTCHECK         := $(OUT_DIR)/shortcutcheck
+
+shortcutcheck: $(OUT_DIR)/iconmaker
+	@if [ ! -f dylib/tests/shortcutcheck.c ]; then $(call SKIP,shortcutcheck,dylib/tests/shortcutcheck.c); exit 0; fi; \
+	mkdir -p $(OUT_DIR) && \
+	$(TEST_CC) -o $(SHORTCUT_BUNDLE_CHECK) dylib/tests/shortcut-bundle-check.c && \
+	$(SHORTCUT_BUNDLE_CHECK) && \
+	$(TEST_CC) -o $(SHORTCUTCHECK) dylib/tests/shortcutcheck.c && \
+	$(SHORTCUTCHECK) && \
+	python3 dylib/tests/shortcut-launch.py $(OUT_DIR)/iconmaker
 
 sigcheck:
 	@if [ ! -f dylib/tests/sigcheck.py ]; then $(call SKIP,sigcheck,dylib/tests/sigcheck.py); exit 0; fi; \
@@ -279,6 +293,14 @@ launch-shell:
 	$(TEST_CC) -O1 -o $(LAUNCH_SHELL) dylib/tests/launch-shell.c && \
 	$(LAUNCH_SHELL)
 
+ACTIVATECHECK := $(OUT_DIR)/activatecheck
+
+activatecheck:
+	@if [ ! -f dylib/tests/activatecheck.c ]; then $(call SKIP,activatecheck,dylib/tests/activatecheck.c); exit 0; fi; \
+	mkdir -p $(OUT_DIR) && \
+	$(TEST_CC) -O1 -o $(ACTIVATECHECK) dylib/tests/activatecheck.c -framework AppKit -lobjc && \
+	$(ACTIVATECHECK)
+
 SPAWN_ENV := $(OUT_DIR)/spawn-env
 
 spawn-env:
@@ -335,6 +357,7 @@ panel-behavior:
 	node $(PANEL_TESTS)/shell.js $(OUT_DIR)/panel-emit && \
 	node $(PANEL_TESTS)/migration.js $(OUT_DIR)/panel-emit && \
 	node $(PANEL_TESTS)/localization.js $(OUT_DIR)/panel-emit && \
+	node $(PANEL_TESTS)/fex.js $(OUT_DIR)/panel-emit && \
 	echo "==> panel behavior: renders as expected, no stale arguments"
 
 CX_ROOT ?= /Applications/CrossOver Preview.app
@@ -443,13 +466,15 @@ ICONMAKER := $(OUT_DIR)/iconmaker
 
 iconmaker: $(ICONMAKER)
 
-$(ICONMAKER): helpers/iconmaker.swift dylib/util/peicon.c dylib/util/peicon.h
+$(ICONMAKER): helpers/iconmaker.swift helpers/iconmaker.h dylib/util/peicon.c dylib/util/peicon.h helpers/shortcuts.h helpers/shortcuts.c
 	@mkdir -p $(OUT_DIR)
 	$(CC) -c -arch $(ARCH) -mmacosx-version-min=$(MIN_VER) $(AVAIL) -std=c17 -O2 \
 		-Wall -Wextra -o $(OUT_DIR)/peicon-host.o dylib/util/peicon.c
+	$(CC) -c -arch $(ARCH) -mmacosx-version-min=$(MIN_VER) $(AVAIL) -std=c17 -O2 \
+		-Wall -Wextra -o $(OUT_DIR)/shortcuts-host.o helpers/shortcuts.c
 	swiftc -O -target $(ARCH)-apple-macos$(MIN_VER) \
-		-framework AppKit -import-objc-header dylib/util/peicon.h \
-		-o $@ helpers/iconmaker.swift $(OUT_DIR)/peicon-host.o
+		-framework AppKit -import-objc-header helpers/iconmaker.h \
+		-o $@ helpers/iconmaker.swift $(OUT_DIR)/peicon-host.o $(OUT_DIR)/shortcuts-host.o
 	@echo "==> Built $@"
 
 APPINFO := $(OUT_DIR)/appinfo

@@ -63,6 +63,62 @@ static void check_fallback(void) {
     np_log_level = saved;
 }
 
+static void check_fex_tools(void) {
+    np_webpatch_set_fex_tools((const char *[]){ "notproton-fex", "bad name", NULL, "",
+                                                "x\"y", "notproton-fex-41069" }, 6);
+    if (strcmp(g_fex_tools, "[\"notproton-fex\",\"notproton-fex-41069\"]") != 0)
+        wrong("the FEX tool array is %s", g_fex_tools);
+
+    np_webpatch_set_fex_tools(NULL, 0);
+    if (strcmp(g_fex_tools, "[]") != 0) wrong("no FEX tools gives %s", g_fex_tools);
+
+    char names[NP_WEBPATCH_FEX_TOOLS_MAX + 1][NP_TOOL_NAME_MAX];
+    const char *list[NP_WEBPATCH_FEX_TOOLS_MAX + 1];
+    for (int i = 0; i <= NP_WEBPATCH_FEX_TOOLS_MAX; i++) {
+        memset(names[i], 'a', NP_TOOL_NAME_MAX - 1);
+        names[i][NP_TOOL_NAME_MAX - 1] = '\0';
+        names[i][0] = (char)('A' + i);
+        list[i] = names[i];
+    }
+    np_webpatch_set_fex_tools(list, NP_WEBPATCH_FEX_TOOLS_MAX + 1);
+    size_t want = 2 + NP_WEBPATCH_FEX_TOOLS_MAX * (NP_TOOL_NAME_MAX + 2) - 1;
+    if (strlen(g_fex_tools) != want || strchr(g_fex_tools, 'A' + NP_WEBPATCH_FEX_TOOLS_MAX))
+        wrong("the longest FEX tool array is %zu bytes, not %zu", strlen(g_fex_tools), want);
+    np_webpatch_set_fex_tools(NULL, 0);
+}
+
+static void check_captures(void) {
+    int seen = 0;
+    for (int c = 1; c < 256; c++) {
+        int ci = cap_index((unsigned char)c);
+        if (ci < 0) continue;
+        seen |= 1 << ci;
+        if (ci >= NP_CAP_MAX || c == ' ' || (c >= '\t' && c <= '\r') || marker_text((char)c))
+            wrong("byte %d reads as capture %d", c, ci + 1);
+    }
+    if (seen != (1 << NP_CAP_MAX) - 1) wrong("captures bound by byte: %#x", seen);
+
+    static const struct { const char *src, *find; size_t want; } cases[] = {
+        { "(0,T.CI)()",  "(0," NP_C1 ".CI)()", 10 },
+        { "(0,9T.CI)()", "(0," NP_C1 ".CI)()", 0 },
+        { "(0,.CI)()",   "(0," NP_C1 ".CI)()", 0 },
+        { "ab.CI",       NP_C1 ".CI",           5 },
+        { "a.b(a)",      NP_C1 ".b(" NP_C1 ")", 6 },
+        { "a.b(c)",      NP_C1 ".b(" NP_C1 ")", 0 },
+    };
+    np_cap_t caps[NP_CAP_MAX];
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *s = cases[i].src;
+        size_t got = match_at(s, strlen(s), 0, cases[i].find, caps);
+        if (got != cases[i].want) wrong("capture case %zu matched %zu bytes, wanted %zu",
+                                        i, got, cases[i].want);
+    }
+    if (match_at("xab.CI", 6, 1, NP_C1 ".CI", caps))
+        wrong("a capture matched from the middle of a name");
+    if (match_at("x.ab.CI", 7, 2, NP_C1 ".CI", caps) || match_at("x?.ab.CI", 8, 3, NP_C1 ".CI", caps))
+        wrong("a capture matched a member");
+}
+
 // Invariants the transform relies on but cannot check at run time. A replacement still
 // holding its own anchor would be found again next pass, and an anchor inside another
 // anchor would make the result depend on table order rather than on the chunk.
@@ -129,8 +185,12 @@ static void selfcheck(void) {
             if (strcmp(S->probe, g_shapes[o].probe) == 0)
                 wrong("[%s] and [%s] share a probe", nm, g_shapes[o].name);
         }
-        for (size_t i = 0; i < S->count; i++)
+        size_t required = 0;
+        for (size_t i = 0; i < S->count; i++) {
             check_gate(nm, i, &S->gates[i], S->gates, S->count);
+            required += !S->gates[i].optional;
+        }
+        if (!required) wrong("[%s] has no required gate", nm);
         total += S->count;
     }
 
@@ -174,10 +234,16 @@ static const np_ui_shape_t *shape_of(const char *buf, size_t len) {
     return NULL;
 }
 
-static void check_output(const char *out, size_t out_len) {
+static void check_output(const char *out, size_t out_len, const int *applied) {
     const np_ui_shape_t *S = shape_of(out, out_len);
     if (!S) { wrong("the patched chunk no longer matches any known compat UI"); return; }
     for (size_t g = 0; g < S->count; g++) {
+        if (!applied[g]) {
+            if (count_matches(out, out_len, S->gates[g].replace))
+                wrong("[%s] optional gate %zu was skipped but its replacement is in the patch",
+                      S->name, g);
+            continue;
+        }
         if (count_matches(out, out_len, S->gates[g].find) != 0)
             wrong("[%s] gate %zu anchor survived the patch", S->name, g);
         if (count_matches(out, out_len, S->gates[g].replace)
@@ -250,25 +316,68 @@ static int extract(const char *chunk, const char *out_path) {
     return 0;
 }
 
+static void check_optional_drift(const np_ui_shape_t *S, size_t g, const uint8_t *buf,
+                                 size_t len, const int *applied) {
+    char *copy = malloc(len + 1);
+    if (!copy) { wrong("out of memory"); return; }
+    memcpy(copy, buf, len + 1);
+    np_cap_t caps[NP_CAP_MAX];
+    for (size_t i = 0; i < len; ) {
+        size_t used = match_at(copy, len, i, S->gates[g].find, caps);
+        if (!used) { i++; continue; }
+        copy[i + used - 1] = '\x01';
+        i += used;
+    }
+    int without[NP_GATE_MAX];
+    memcpy(without, applied, sizeof(without));
+    without[g] = 0;
+
+    int saved = np_log_level;
+    np_log_level = -1;
+    size_t out_len = 0;
+    char *out = np_webpatch_transform((const uint8_t *)copy, len, &out_len, NULL);
+    np_log_level = saved;
+    if (out) {
+        check_output(out, out_len, without);
+        free(out);
+    } else {
+        wrong("[%s] drift in optional gate %zu left the whole shape unpatched", S->name, g);
+    }
+    free(copy);
+}
+
 int main(int argc, char **argv) {
     if (argc == 4 && strcmp(argv[1], "--extract") == 0)
         return extract(argv[2], argv[3]);
 
-    if (argc < 2) { selfcheck(); check_fallback(); return g_wrong; }
+    if (argc < 2) {
+        selfcheck(); check_captures(); check_fallback(); check_fex_tools();
+        return g_wrong;
+    }
 
     np_webpatch_set_fallback_tool("notproton-fex");
+    np_webpatch_set_fex_tools((const char *[]){ "notproton-fex", "notproton-fex-41069" }, 2);
 
     for (int i = 1; i < argc; i++) {
         size_t len = 0;
         uint8_t *buf = slurp(argv[i], &len);
         if (!buf) { wrong("cannot read %s", argv[i]); continue; }
 
+        const np_ui_shape_t *S = shape_of((const char *)buf, len);
+        int applied[NP_GATE_MAX] = {0};
+        for (size_t g = 0; S && g < S->count; g++)
+            applied[g] = count_matches((const char *)buf, len, S->gates[g].find)
+                         == (size_t)S->gates[g].expect;
+
         size_t out_len = 0;
         char *out = np_webpatch_transform(buf, len, &out_len, NULL);
         if (out) {
-            check_output(out, out_len);
+            check_output(out, out_len, applied);
             printf("APPLIED  %s\n", argv[i]);
             free(out);
+            for (size_t g = 0; S && g < S->count; g++)
+                if (S->gates[g].optional && applied[g])
+                    check_optional_drift(S, g, buf, len, applied);
         } else {
             printf("REJECTED %s\n", argv[i]);
         }

@@ -52,6 +52,11 @@ np_patch_entry_t *np_hooks_shortcut_defs(void);
 int               np_hooks_icon_count(void);
 np_patch_entry_t *np_hooks_icon_defs(void);
 
+int               np_hooks_shortcut_bundle_count(void);
+np_patch_entry_t *np_hooks_shortcut_bundle_defs(void);
+
+void np_hooks_shortcut_bundle_bind(const struct mach_header_64 *steamui);
+
 int np_hooks_install_all(const struct mach_header_64 *mh, intptr_t slide,
                          np_resolve_result_t *resolved, int *total_out);
 
@@ -67,5 +72,7 @@ void np_hooks_launch_install(const struct mach_header_64 *mh, intptr_t slide);
 // Resolved from libc rather than the signature database, and installed before the client
 // can spawn anything, so this one does not wait for steamclient the way the rest do.
 void np_hooks_spawn_install(void);
+
+void np_hooks_activate_install(void);
 
 #endif // NOTPROTON_HOOKS_HOOKS_H
