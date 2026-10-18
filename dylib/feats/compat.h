@@ -40,6 +40,13 @@ int np_compat_probe_tool_layout(uintptr_t appid_gate, uintptr_t oslist_gate);
 int np_compat_probe_enabled_off(uintptr_t bis_enabled);
 uint32_t np_compat_enabled_off(void);
 
+// Reads the windows-only table's offset out of the lookup call in GetWildcardMapping,
+// returns 0 when the call is not found.
+int  np_compat_probe_windows_only_off(uintptr_t get_wildcard_mapping, uintptr_t lookup);
+bool np_compat_is_windows_only_table(const void *compat_mgr, const void *map);
+
+void *np_compat_user(const void *compat_mgr);
+
 // Live position of a field by its reference offset. Fields ahead of the
 // insertion point come back unchanged.
 uint32_t np_compat_tool_off(uint32_t reference_off);
@@ -119,6 +126,9 @@ void *np_compat_registered_tool(void *compat_mgr);
 
 // Name of the first tool in the app's list, which unmapped Windows games run under.
 const char *np_compat_fallback_tool_name(void);
+
+// Names of the listed tools whose flavor is fex, up to max. Returns how many it wrote.
+size_t np_compat_fex_tools(const char **names, size_t max);
 
 uint32_t np_compat_manager_tools_max(void);
 

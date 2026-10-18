@@ -4,6 +4,7 @@
 #include "../core/macho.h"
 #include "../feats/webui.h"
 #include "../feats/compat.h"
+#include "../feats/usershortcuts.h"
 #include "../util/log.h"
 #include <stdlib.h>
 #include <string.h>
@@ -45,8 +46,9 @@ static const np_hook_group_t np_groups[] = {
 };
 
 static const np_hook_group_t np_steamui_groups[] = {
-    { "shortcut", np_hooks_shortcut_count, np_hooks_shortcut_defs },
-    { "icon",     np_hooks_icon_count,     np_hooks_icon_defs     },
+    { "shortcut", np_hooks_shortcut_count,        np_hooks_shortcut_defs        },
+    { "icon",     np_hooks_icon_count,            np_hooks_icon_defs            },
+    { "bundle",   np_hooks_shortcut_bundle_count, np_hooks_shortcut_bundle_defs },
 };
 
 // Installs one entry. Returns 1 when the patch lands, 0 when it is skipped or fails.
@@ -103,8 +105,8 @@ static int install_groups(const np_hook_group_t *groups, size_t n_groups,
 
 int np_hooks_install_steamui(const struct mach_header_64 *mh, intptr_t slide,
                              np_resolve_result_t *resolved, int *total_out) {
-    (void)mh;
     (void)slide;
+    np_hooks_shortcut_bundle_bind(mh);
 
     int total  = 0;
     int landed = install_groups(np_steamui_groups,
@@ -132,6 +134,11 @@ int np_hooks_install_all(const struct mach_header_64 *mh, intptr_t slide,
         np_lookup_address(resolved, "CCompatManager::GetOSListOverrideForApp.oslist_gate"));
     np_compat_probe_enabled_off(
         np_lookup_address(resolved, "CCompatManager::BIsCompatibilityToolEnabled"));
+    np_compat_probe_windows_only_off(
+        np_lookup_address(resolved, "CCompatManager::GetWildcardMapping"),
+        np_lookup_address(resolved, "CCompatManager::WindowsOnlyLookup"));
+    np_usershortcuts_bind(mh, slide,
+        np_lookup_address(resolved, "CUserShortcuts::SetShortcutExe"));
 
     uintptr_t register_fn = np_lookup_address(resolved,
                                              "CWebUIJobDispatcher::RegisterHandler");

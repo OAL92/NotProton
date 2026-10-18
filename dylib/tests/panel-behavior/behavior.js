@@ -21,7 +21,7 @@ for (const form of Object.keys(FORMS)) {
        'a shortcut renders the panel before a tool name reaches the page');
 
   let r = nodes('');
-  t.ok(toggles(r).length === 6 && sections(r).length === 3, 'automatic shows six toggles in three sections');
+  t.ok(toggles(r).length === 7 && sections(r).length === 3, 'automatic shows seven toggles in three sections');
   t.ok(r.filter(x => x.type === 'Dropdown').length === 2, 'two dropdowns');
   t.ok(!('label' in r.find(x => x.type === 'Dropdown').props), 'the backend dropdown carries no label column');
 
@@ -79,12 +79,13 @@ for (const form of Object.keys(FORMS)) {
   const root = P({ details: details('') });
   t.ok(root.props.className === 'MSCXPanel', 'the panel root carries its own class');
   const classes = nodes('').filter(x => x.type === 'Toggle').map(x => x.props.className);
-  t.ok(classes.length === 6 && classes.every(c => c === 'MSCXRow'), 'every checkbox carries the row class');
-  const raw = o => nodes(o).find(x => x.props.label === 'Let games read controllers directly');
+  t.ok(classes.length === 7 && classes.every(c => c === 'MSCXRow'), 'every checkbox carries the row class');
+  const raw = o => nodes(o).find(x => x.props.label === 'Let games read controllers directly (May break Steam Input. Not recommended)');
   t.ok(sections(nodes('')).includes('Controllers') && raw('').props.checked === false,
        'controller hiding is on unless the game says otherwise');
-  t.ok(nodes('').some(x => x.type === 'Section' && x.props.label === 'Controllers (May break Steam Input. Not recommended)'),
-       'the controller section warns what the row changes');
+  written.length = 0;
+  nodes('').find(x => x.props.label === 'Disable hidraw').props.onChange(true);
+  t.ok(last().trim() === 'NOTPROTON_DISABLE_HIDRAW=1 %command%', `hidraw (${last()})`);
   written.length = 0;
   raw('').props.onChange(true);
   t.ok(last().trim() === 'NOTPROTON_RAW_CONTROLLERS=1 %command%', `the controller row writes its flag (${last()})`);
@@ -95,6 +96,11 @@ for (const form of Object.keys(FORMS)) {
   const css = nodes('').filter(x => x.type === 'style');
   t.ok(css.length === 1 && css[0].props.children.includes('.MSCXPanel .MSCXRow{'),
        'the panel carries one stylesheet defining the row rule');
+
+  const { render: S } = panel(emit, form, undefined, { names: ['o', 't'] });
+  const shadowed = walk(S({ details: details('CX_GRAPHICS_BACKEND=dxmt %command%') }));
+  t.ok(JSON.stringify(shadowed) === JSON.stringify(nodes('CX_GRAPHICS_BACKEND=dxmt')),
+       'a page naming its runtime and barrel o and t renders the same panel');
 
   failed += t.failed;
 }
