@@ -44,6 +44,9 @@ SRCS := \
 	dylib/feats/compat.c \
 	dylib/feats/webui.c \
 	dylib/feats/compatsvc.c \
+	dylib/feats/defaults.c \
+	dylib/feats/compatpage.c \
+	dylib/feats/prefixstate.c \
 	dylib/feats/usershortcuts.c \
 	dylib/feats/webpatch.c \
 	dylib/feats/nativeplatform.c \
@@ -70,7 +73,7 @@ DEPS := $(OBJS:.o=.d)
         tests-list overlay-shim overlay-shim-install overlay-shim-tests \
         overlay-shim-bench iconmaker icon \
         appinfo helpers-install ntdll-resolve bridge runcheck compatcheck \
-        compatsvc-check shortcutcheck scriptcheck envcheck buildcheck settingscheck routecheck bridgecheck gamedrivecheck launchercheck launch-shell activatecheck FORCE
+        compatsvc-check prefixstate-check defaults-check compatpage-check defaults-drift shortcutcheck scriptcheck envcheck buildcheck settingscheck routecheck bridgecheck gamedrivecheck launchercheck launch-shell activatecheck FORCE
 
 APP_PAYLOAD := app/Sources/NotProtonApp/Resources/payload
 
@@ -163,6 +166,14 @@ compatcheck: $(RUN_SCRIPT_H)
 	  -o $(COMPATCHECK) dylib/tests/compatcheck.c && \
 	$(COMPATCHECK)
 
+PREFIXSTATE_CHECK := $(OUT_DIR)/prefixstate-check
+
+prefixstate-check:
+	@if [ ! -f dylib/tests/prefixstate-check.c ]; then $(call SKIP,prefixstate-check,dylib/tests/prefixstate-check.c); exit 0; fi; \
+	mkdir -p $(OUT_DIR) && \
+	$(TEST_CC) -o $(PREFIXSTATE_CHECK) dylib/tests/prefixstate-check.c && \
+	$(PREFIXSTATE_CHECK)
+
 COMPATSVC_CHECK := $(OUT_DIR)/compatsvc-check
 
 compatsvc-check:
@@ -170,6 +181,27 @@ compatsvc-check:
 	mkdir -p $(OUT_DIR) && \
 	$(TEST_CC) -o $(COMPATSVC_CHECK) dylib/tests/compatsvc-check.c && \
 	$(COMPATSVC_CHECK)
+
+DEFAULTS_CHECK := $(OUT_DIR)/defaults-check
+
+$(DEFAULTS_CHECK): dylib/tests/defaults-check.c dylib/feats/defaults.c dylib/feats/defaults.h \
+                   dylib/util/buildid.h dylib/util/file.c dylib/util/file.h
+	@mkdir -p $(dir $@)
+	$(TEST_CC) -o $@ dylib/tests/defaults-check.c dylib/util/file.c
+
+defaults-check: $(DEFAULTS_CHECK)
+	@$(DEFAULTS_CHECK)
+
+COMPATPAGE_CHECK := $(OUT_DIR)/compatpage-check
+
+compatpage-check:
+	@if [ ! -f dylib/tests/compatpage-check.c ]; then $(call SKIP,compatpage-check,dylib/tests/compatpage-check.c); exit 0; fi; \
+	mkdir -p $(OUT_DIR) && \
+	$(TEST_CC) -o $(COMPATPAGE_CHECK) dylib/tests/compatpage-check.c dylib/feats/defaults.c dylib/util/file.c && \
+	$(COMPATPAGE_CHECK)
+
+defaults-drift: $(DEFAULTS_CHECK)
+	@sh dylib/tests/defaults-drift.sh $(DEFAULTS_CHECK)
 
 SHORTCUT_BUNDLE_CHECK := $(OUT_DIR)/shortcut-bundle-check
 SHORTCUTCHECK         := $(OUT_DIR)/shortcutcheck
@@ -377,6 +409,8 @@ panel-behavior:
 	node $(PANEL_TESTS)/migration.js $(OUT_DIR)/panel-emit && \
 	node $(PANEL_TESTS)/localization.js $(OUT_DIR)/panel-emit && \
 	node $(PANEL_TESTS)/fex.js $(OUT_DIR)/panel-emit && \
+	node $(PANEL_TESTS)/prefix-row.js $(OUT_DIR)/panel-emit && \
+	node $(PANEL_TESTS)/defaults.js $(OUT_DIR)/panel-emit && \
 	echo "==> panel behavior: renders as expected, no stale arguments"
 
 CX_ROOT ?= /Applications/CrossOver Preview.app
@@ -543,7 +577,7 @@ fonts-install:
 	@rsync -a --delete $(FONT_FILES) build/fonts/ "$(SUPPORT_DIR)/fonts/"
 	@echo "==> Installed: $(SUPPORT_DIR)/fonts"
 
-deploy: $(TARGET) dylib-install sigdb-install fonts-install helpers-install
+deploy: $(TARGET) dylib-install sigdb-install fonts-install helpers-install prefix-command-install
 	@if [ ! -d "$(STEAM_APP)" ]; then \
 		echo "==> deploy: $(STEAM_APP) not found"; exit 1; fi
 	$(call install_atomically,$(TARGET),$(DEPLOY_DST))
@@ -608,6 +642,16 @@ APP_ZIP     := $(OUT_DIR)/NotProton.zip
 APP_VERSION := $(shell sed -n 's/^\#define NOTPROTON_VERSION "\(.*\)"/\1/p' dylib/version.h)
 
 APP_SIGN_ID ?= -
+
+.PHONY: prefix-command-install
+# Records an app bundle that is already built. Building it here would make every deploy
+# build the whole app.
+prefix-command-install:
+	@if [ ! -x "$(APP_BUNDLE)/Contents/MacOS/NotProtonApp" ]; then \
+		echo "==> no $(APP_BUNDLE) yet, run make app for rebuilds from Steam"; exit 0; fi; \
+	mkdir -p "$(SUPPORT_DIR)" && \
+	printf '%s' "$(CURDIR)/$(APP_BUNDLE)/Contents/MacOS/NotProtonApp" > "$(SUPPORT_DIR)/app-executable.new" && \
+	mv -f "$(SUPPORT_DIR)/app-executable.new" "$(SUPPORT_DIR)/app-executable"
 
 ICONGEN  := $(OUT_DIR)/icongen
 ICON_DOC := $(OUT_DIR)/NotProton.icon
