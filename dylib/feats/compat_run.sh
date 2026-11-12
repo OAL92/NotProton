@@ -83,7 +83,7 @@ resolve_icon() {
   fi
   # Capsule art (horrible) fallback if no icon at all exists...
   if [ -z "$art" ]; then
-    for name in library_600x900.jpg header.jpg; do
+    for name in library_600x900.jpg library_capsule.jpg library_header.jpg header.jpg; do
       found=$(find "$art_dir" -name "$name" 2>/dev/null | head -1)
       [ -n "$found" ] && { art="$found"; break; }
     done
@@ -114,10 +114,69 @@ resolve_icon() {
       # guard on every launch, so drop it to force a clean fetch next time.
       rm -f "$ico"
       echo "discarded unreadable client icon $meta_clienticon" >> "$log" 2>&1 || true
+      clienticon=$meta_clienticon
+      meta_clienticon=""
+      resolve_icon
+      icon_status=$?
+      meta_clienticon=$clienticon
     fi
   fi
   set -e
   return $icon_status
+}
+
+lsregister="/System/Library/Frameworks/CoreServices.framework/Versions/A"
+lsregister="$lsregister/Frameworks/LaunchServices.framework/Support/lsregister"
+plistbuddy=/usr/libexec/PlistBuddy
+lsappinfo=/usr/bin/lsappinfo
+games_arg="  <key>LSApplicationCategoryType</key><string>public.app-category.games</string>"
+# display name, bundle ID, executable, extra keys
+bundle_plist() {
+  cat <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>$game_name_xml</string>
+  <key>CFBundleDisplayName</key><string>$1</string>
+  <key>CFBundleIdentifier</key><string>$2</string>
+  <key>CFBundleExecutable</key><string>$3</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSPrincipalClass</key><string>NSApplication</string>
+  <key>NSMicrophoneUsageDescription</key><string>This game would like to access your microphone.</string>
+  <key>NSCameraUsageDescription</key><string>This game would like to access your camera.</string>
+  <key>NSLocalNetworkUsageDescription</key><string>This game would like to access devices on your local network.</string>
+$4
+$icon_arg
+</dict>
+</plist>
+PLIST
+}
+np_game_names() {
+  # shellcheck disable=SC1003 # the pair deletes a literal backslash, not a quote
+  bundle_name=$(printf '%s' "$game_name" | tr -d '/:"`$\\')
+  bundle_name=${bundle_name#"${bundle_name%%[!.]*}"}
+  [ -n "$bundle_name" ] || bundle_name="Steam Game"
+  game_name_xml=$(printf '%s' "$game_name" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
+}
+np_game_running() {
+  [ -n "$("$lsappinfo" find bundleid="com.notproton.launcher.$1" 2>/dev/null)" ]
+}
+np_game_mode_by_key() {
+  np_macos=$(sw_vers -productVersion 2>/dev/null | cut -d. -f1)
+  [ "${np_macos:-0}" -ge 26 ] 2>/dev/null
+}
+np_handoff() {
+  # shellcheck disable=SC2016 # $1 is for the launcher
+  printf 'case "$1" in\n  ""|-psn_*) exec /usr/bin/open "%s" ;;\nesac\n' "$1"
+}
+np_tile() {
+  mkdir -p "$1/MacOS" &&
+    bundle_plist "$game_name_xml" "com.notproton.game.$2" launcher "$games_arg" > "$1/Info.plist" &&
+    printf '#!/bin/sh\nexec /usr/bin/open "%s"\n' "$3" > "$1/MacOS/launcher" &&
+    chmod +x "$1/MacOS/launcher"
 }
 
 case "$verb" in
@@ -135,6 +194,99 @@ case "$verb" in
     resolve_icon && "$iconmaker" --shortcuts "$app_id" "$icon_cache" "$2/steam.icns" >> "$log" 2>&1 || true
     exit 0
     ;;
+  game-tile)
+    app_id="$1"
+    case "$app_id" in ''|0|*[!0-9]*) exit 1 ;; esac
+    case "$2" in ''|0|*[!0-9]*) exit 1 ;; esac
+    case "$3" in /*) ;; *) exit 1 ;; esac
+    loader_root="$3"
+    [ -d "$loader_root" ] || exit 1
+    exec 7>> "$loader_root/.lock"
+    /usr/bin/lockf -s -t 0 7 || exit 0
+    ! np_game_running "$app_id" || exit 0
+    steam_url="steam://rungameid/$2"
+    runner_app=""
+    for b in "$loader_root"/runner/lib/wine/*-unix/wine.app; do
+      if [ "$("$plistbuddy" -c 'Print :CFBundleIdentifier' "$b/Contents/Info.plist" 2>/dev/null)" = "com.notproton.launcher.$app_id" ]; then
+        runner_app=$b
+      fi
+    done
+    if [ -n "$runner_app" ]; then
+      info="$runner_app/Contents/Info.plist"
+      if np_game_mode_by_key; then
+        changed=""
+        if "$plistbuddy" -c 'Print :LSApplicationCategoryType' "$info" > /dev/null 2>&1; then
+          "$plistbuddy" -c 'Delete :LSApplicationCategoryType' "$info" && changed=1
+        fi
+        if [ "$("$plistbuddy" -c 'Print :LSSupportsGameMode' "$info" 2>/dev/null)" != true ]; then
+          { "$plistbuddy" -c 'Add :LSSupportsGameMode bool true' "$info" 2> /dev/null ||
+            "$plistbuddy" -c 'Set :LSSupportsGameMode true' "$info"; } && changed=1
+        fi
+        [ -z "$changed" ] || "$lsregister" -f "$runner_app" || true
+      fi
+      game_name=$("$plistbuddy" -c 'Print :CFBundleName' "$info" 2> /dev/null) || game_name=""
+      np_game_names
+      tile="$loader_root/$bundle_name.app"
+      if [ "$("$plistbuddy" -c 'Print :CFBundleIdentifier' "$tile/Contents/Info.plist" 2>/dev/null)" != "com.notproton.game.$app_id" ] ||
+         [ "$("$plistbuddy" -c 'Print :LSApplicationCategoryType' "$tile/Contents/Info.plist" 2>/dev/null)" != public.app-category.games ] ||
+         [ ! -x "$tile/Contents/MacOS/launcher" ]; then
+        stage=$(mktemp -d "$loader_root/.build.XXXXXX")
+        mkdir -p "$stage/Tile.app/Contents/Resources"
+        icon_arg=""
+        if cp "$runner_app/Contents/Resources/game.icns" "$stage/Tile.app/Contents/Resources/game.icns" 2> /dev/null; then
+          icon_arg="  <key>CFBundleIconFile</key><string>game</string>"
+        fi
+        if np_tile "$stage/Tile.app/Contents" "$app_id" "$steam_url" && rm -rf "$tile" && mv "$stage/Tile.app" "$tile"; then
+          "$lsregister" -f "$tile" || true
+        fi
+        rm -rf "$stage"
+      fi
+      for b in "$loader_root"/*.app "$loader_root"/.[!.]*.app; do
+        if [ "$b" != "$tile" ] && { [ -e "$b" ] || [ -L "$b" ]; }; then rm -rf "$b"; fi
+      done
+    else
+      for b in "$loader_root"/*.app; do
+        info="$b/Contents/Info.plist"
+        script="$b/Contents/MacOS/launcher"
+        if [ "$("$plistbuddy" -c 'Print :CFBundleIdentifier' "$info" 2>/dev/null)" != "com.notproton.launcher.$app_id" ] ||
+           [ "$("$plistbuddy" -c 'Print :CFBundleExecutable' "$info" 2>/dev/null)" != launcher ]; then
+          continue
+        fi
+        changed=""
+        if [ "$(head -n 1 "$script" 2> /dev/null)" = "#!/bin/sh" ] && ! grep -q 'steam://rungameid/' "$script"; then
+          { echo '#!/bin/sh'; np_handoff "$steam_url"; sed 1d "$script"; } > "$script.new" &&
+            chmod 755 "$script.new" && mv -f "$script.new" "$script" && changed=1
+        fi
+        if ! "$plistbuddy" -c 'Print :LSApplicationCategoryType' "$info" > /dev/null 2>&1; then
+          "$plistbuddy" -c 'Add :LSApplicationCategoryType string public.app-category.games' "$info" && changed=1
+        fi
+        [ -z "$changed" ] || "$lsregister" -f "$b" || true
+      done
+    fi
+    exit 0
+    ;;
+  game-untile)
+    app_id="$1"
+    case "$app_id" in ''|0|*[!0-9]*) exit 1 ;; esac
+    case "$2" in /*) ;; *) exit 1 ;; esac
+    loader_root="$2"
+    [ -d "$loader_root" ] || exit 1
+    np_game_mode_by_key || exit 0
+    exec 7>> "$loader_root/.lock"
+    /usr/bin/lockf -s -t 0 7 || exit 0
+    ! np_game_running "$app_id" || exit 0
+    for b in "$loader_root"/runner/lib/wine/*-unix/wine.app "$loader_root"/*.app "$loader_root"/.[!.]*.app; do
+      info="$b/Contents/Info.plist"
+      case "$("$plistbuddy" -c 'Print :CFBundleIdentifier' "$info" 2>/dev/null)" in
+        "com.notproton.launcher.$app_id"|"com.notproton.game.$app_id") ;;
+        *) continue ;;
+      esac
+      if "$plistbuddy" -c 'Print :LSApplicationCategoryType' "$info" > /dev/null 2>&1; then
+        "$plistbuddy" -c 'Delete :LSApplicationCategoryType' "$info" && { "$lsregister" -f "$b" || true; }
+      fi
+    done
+    exit 0
+    ;;
 esac
 
 # cxcompatdb resolves its database through CX_HOME and logs an error for
@@ -144,6 +296,8 @@ np_flavor=""
 np_build=""
 CDPATH=''
 np_tool_dir=$(cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || np_tool_dir=""
+# The folder's name is the tool's name, which is what a plugin's "tools" is matched against.
+np_tool_name=$(basename -- "${np_tool_dir:-.}")
 if [ -n "$np_tool_dir" ] && [ -r "$np_tool_dir/flavor" ]; then
   read -r np_flavor < "$np_tool_dir/flavor" || np_flavor=""
 fi
@@ -154,7 +308,829 @@ case "$np_build" in *[!A-Za-z0-9.-]*) np_build="" ;; esac
 np_display=$(sed -n 's/.*"display_name"[[:space:]]*"\(.*\)".*/\1/p' \
   "$np_tool_dir/compatibilitytool.vdf" 2>/dev/null | head -1) || np_display=""
 [ -n "$np_display" ] || np_display="CrossOver build ${np_build:-unknown}"
+if [ -n "$STEAM_COMPAT_DATA_PATH" ]; then
+  log="$STEAM_COMPAT_DATA_PATH/notproton-run.log"
+else
+  log=/dev/null
+fi
+[ "$(stat -f %z "$log" 2>/dev/null || echo 0)" -gt 262144 ] \
+  && : > "$log" || true
+# Plugin and variant descriptors, normalised exactly as dylib/feats/conf.c does, so the
+# panel and the launch agree on every file: one "id<TAB>field<TAB>value" line per field
+# in the order read, "!<TAB>scope<TAB>code[:detail]" where one was refused, and a
+# "== <path>" line as each file is opened.
+np_conf_normalise() (
+  np_conf_dir=$1
+  np_conf_shown=$2
+  np_conf_kind=$3
+  # Byte order, which is the order webpatch.c reads them in. A name carrying a tab or a
+  # newline is skipped rather than normalised: either would break the lines below.
+  np_conf_names=$(
+    for np_conf_file in "$np_conf_dir"/*.conf; do
+      case ${np_conf_file##*/} in
+        (*'	'*) continue ;;
+      esac
+      if [ -f "$np_conf_file" ] && [ ! -r "$np_conf_file" ]; then
+        printf '!\t%s\tunreadable\n' "${np_conf_file##*/}" >&2
+      fi
+      [ -f "$np_conf_file" ] && [ -r "$np_conf_file" ] || continue
+      printf '%s\n' "${np_conf_file##*/}"
+    done | LC_ALL=C sort
+  )
+  [ -n "$np_conf_names" ] || return 0
+  set --
+  while IFS= read -r np_conf_name; do
+    [ -f "$np_conf_dir/$np_conf_name" ] || continue
+    set -- "$@" "$np_conf_dir/$np_conf_name"
+  done <<NP_CONF_NAMES
+$np_conf_names
+NP_CONF_NAMES
+  [ "$#" -gt 0 ] || return 0
+  LC_ALL=C awk -v kind="$np_conf_kind" -v shown="$np_conf_shown" '
+  function trim(s) { gsub(/^[ \t\r\n\v\f]+|[ \t\r\n\v\f]+$/, "", s); return s }
+  function isnum(s) {
+    return s ~ /^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$/ \
+      && s + 0 <= 1.7976931348623157e308 && s + 0 >= -1.7976931348623157e308
+  }
+  function idok(s,   i, c) {
+    if (length(s) >= 192 || s == "") return 0
+    if (kind == "plugin") {
+      if (substr(s, 1, 10) != "NOTPROTON_" || length(s) == 10) return 0
+      return substr(s, 11) ~ /^[A-Z0-9_]+$/
+    }
+    return length(s) <= 64 && s ~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/
+  }
+  function choiceval(s,   eq) {
+    eq = index(s, "=")
+    return eq ? trim(substr(s, 1, eq - 1)) : s
+  }
+  function toolok(s) { sub(/\*$/, "", s); return s ~ /^[A-Za-z0-9._-]+$/ }
+  function envok(s,   eq) {
+    eq = index(s, "=")
+    return eq > 1 && substr(s, 1, eq - 1) ~ /^[A-Z_][A-Z0-9_]*$/
+  }
+  function relok(s, top) {
+    if (substr(s, 1, 1) == "/" || index(s, "..")) return 0
+    return top || s ~ /[^.\/]/
+  }
+  function refuse(scope, c, d) { printf "!\t%s\t%s%s%s\n", scope, c, (d == "" ? "" : ":"), d }
+  function schema(   i, f, t, values, mn, mx, st, df) {
+    for (i = 1; i <= nreq; i++)
+      if (!(req[i] in cnt)) { detail = req[i]; return "missing-required" }
+    if (kind == "variant") {
+      if (!relok(first["dst"], 1)) { detail = "dst"; return "bad-value" }
+      for (i = 1; i <= nkv; i++) {
+        if (names[i] == "remove" && !relok(vals[i], 0)) { detail = "remove"; return "bad-value" }
+        if (names[i] == "build" && vals[i] !~ /^[A-Za-z0-9.-]+$/) { detail = "build"; return "bad-value" }
+      }
+      return ""
+    }
+    for (i = 1; i <= nkv; i++) {
+      if (names[i] == "env" && !envok(vals[i])) { detail = "env"; return "bad-value" }
+      if (names[i] == "choice" && choiceval(vals[i]) == "") { detail = "choice"; return "bad-value" }
+      if (names[i] == "tools" && !toolok(vals[i])) { detail = "tools"; return "bad-value" }
+      if (names[i] == "hide_crossover" && vals[i] != "1") { detail = "hide_crossover"; return "bad-value" }
+    }
+    if (("hide_crossover" in cnt) && !("tools" in cnt)) { detail = "tools"; return "missing-required" }
+    if (("depends" in cnt) && !idok(first["depends"])) { detail = "depends"; return "bad-value" }
+    if (("section" in cnt) && first["section"] != "dev") { detail = "section"; return "bad-value" }
+    if (!("type" in cnt)) return ""
+    t = first["type"]
+    values = ("choice" in cnt) ? cnt["choice"] : 0
+    mn = ("min" in cnt); mx = ("max" in cnt); st = ("step" in cnt); df = ("default" in cnt)
+    if (t == "choice") {
+      if (!values) { detail = "choice"; return "missing-required" }
+      return ""
+    }
+    if (t != "slider") { detail = t; return "bad-type" }
+    if ((values && (mn || mx)) || (!values && !(mn && mx)) || values == 1) return "slider-shape"
+    if (values) {
+      if (df) { for (i = 1; i <= nkv; i++)
+                  if (names[i] == "choice" && choiceval(vals[i]) == first["default"]) return ""
+                return "bad-default" }
+      return ""
+    }
+    if (!isnum(first["min"])) { detail = "min"; return "bad-value" }
+    if (!isnum(first["max"]) || first["max"] + 0 <= first["min"] + 0) { detail = "max"; return "bad-value" }
+    if (st && (!isnum(first["step"]) || first["step"] + 0 <= 0)) { detail = "step"; return "bad-value" }
+    if (df && (!isnum(first["default"]) || first["default"] + 0 < first["min"] + 0 || first["default"] + 0 > first["max"] + 0))
+      return "bad-default"
+    return ""
+  }
+  # Clears a record, refused or not, so nothing it held reaches the next one.
+  function reset() {
+    id = ""; code = ""; detail = ""; nkv = 0; bytes = 0
+    split("", cnt); split("", first)
+  }
+  function flush(   i, c) {
+    if (id == "") { reset(); return }
+    c = code
+    if (c == "") { detail = ""; c = schema() }
+    if (c == "") {
+      if (id in seen) { c = "duplicate-id"; detail = "" }
+      else if (records >= 32) { c = "limit"; detail = "" }
+      else { seen[id] = 1; records++ }
+    }
+    # conf.c holds 191 bytes of an id and 63 of a field name, and names them that way.
+    if (c != "") refuse(substr(id, 1, 191), c, substr(detail, 1, 63))
+    else for (i = 1; i <= nkv; i++) printf "%s\t%s\t%s\n", id, names[i], vals[i]
+    reset()
+  }
+  function startfile(   base) {
+    base = FILENAME
+    sub(/^.*\//, "", base)
+    printf "== %s%s%s\n", shown, (shown == "" ? "" : "/"), base
+    path = shown (shown == "" ? "" : "/") base
+    header = 0; dropped = 0
+  }
+  BEGIN {
+    nkv = 0; records = 0; id = ""; code = ""; detail = ""
+    if (kind == "plugin") {
+      split("label description description_on section on off depends requires inject env overrides stage tools type choice min max step default suffix hide_crossover", f, " ")
+      split("1 1 16 1 1 1 1 4 1 16 1 1 8 1 16 1 1 1 1 1 1", m, " ")
+      split("label", req, " "); nreq = 1
+    } else {
+      split("label variant src dst build remove", f, " ")
+      split("1 1 1 1 8 32", m, " ")
+      split("src dst", req, " "); nreq = 2
+    }
+    for (i in f) most[f[i]] = m[i] + 0
+  }
+  FNR == 1 { flush(); startfile() }
+  dropped { next }
+  {
+    if (length($0) >= 2048) { reset(); refuse(path, "line-too-long", ""); dropped = 1; next }
+    k = $0
+    sub(/^[ \t\r\n\v\f]+/, "", k)
+    if (k == "" || substr(k, 1, 1) == "#") next
+    if (substr(k, 1, 1) == "[") {
+      cl = 0
+      for (i = length(k); i > 1; i--) if (substr(k, i, 1) == "]") { cl = i; break }
+      if (!cl) next
+      flush()
+      header = 1
+      id = trim(substr(k, 2, cl - 2))
+      if (id == "") refuse(path, "bad-id", "")
+      else if (!idok(id)) { code = "bad-id"; detail = "" }
+      next
+    }
+    eq = index(k, "=")
+    if (!eq) next
+    if (!header) { reset(); refuse(path, "no-header", ""); dropped = 1; next }
+    if (code != "") next
+    name = trim(substr(k, 1, eq - 1))
+    val = trim(substr(k, eq + 1))
+    if (!(name in most)) { code = "unknown-field"; detail = name; next }
+    if (val == "") { code = "empty-value"; detail = name; next }
+    if (index(val, "\t")) { code = "tab-in-value"; detail = name; next }
+    if ((name in cnt ? cnt[name] : 0) >= most[name]) {
+      code = (most[name] == 1 ? "duplicate-field" : "limit"); detail = name; next
+    }
+    if (bytes + length(name) + length(val) + 2 > 4096) { code = "limit"; detail = name; next }
+    nkv++; names[nkv] = name; vals[nkv] = val
+    bytes += length(name) + length(val) + 2
+    if (!(name in cnt)) { cnt[name] = 0; first[name] = val }
+    cnt[name]++
+  }
+  END { flush() }
+  ' "$@"
+)
+
+# The normalised table is built once per directory and read with these, so nothing below
+# parses a descriptor itself.
+np_conf_value() {
+  printf '%s\n' "$1" | awk -F'\t' -v i="$2" -v f="$3" '$1 == i && $2 == f { print $3; exit }'
+}
+np_conf_values() {
+  printf '%s\n' "$1" | awk -F'\t' -v i="$2" -v f="$3" '$1 == i && $2 == f { print $3 }'
+}
+np_conf_ids() {
+  printf '%s\n' "$1" | awk -F'\t' '$1 != "!" && $1 !~ /^== / && !seen[$1]++ { print $1 }'
+}
+np_conf_has() {
+  printf '%s\n' "$1" | awk -F'\t' -v i="$2" '$1 == i { found = 1 } END { exit !found }'
+}
+# A path a descriptor names: absolute, or under $HOME however it is written, as
+# resolve_home_path in webpatch.c reads it.
+np_home_path() {
+  # shellcheck disable=SC2088,SC2016
+  case "$1" in
+    (/*) printf '%s' "$1" ;;
+    ("~/"*) printf '%s/%s' "$HOME" "${1#"~/"}" ;;
+    ('$HOME/'*) printf '%s/%s' "$HOME" "${1#'$HOME/'}" ;;
+    (*) printf '%s/%s' "$HOME" "$1" ;;
+  esac
+}
+# Every refusal the reader found, logged the way the panel logs its own.
+np_conf_log() {
+  printf '%s\n' "$1" | awk -F'\t' -v k="$2" '$1 == "!" {
+    printf "=== %s: %s refused, %s ===\n", k, $2, $3
+  }' >> "${log:-/dev/null}" 2>&1 || true
+}
+
+# A runner variant carries a different build of something that has to be builtin, which is
+# the only reason to replace a whole runner rather than drop a DLL in the prefix. Each one
+# is a descriptor naming a tree and where that tree lands in the runner, so nothing here
+# knows what any particular variant contains. Variants are clones, so resolving per game
+# means two games can use different ones at once.
+np_variant_conf_dir="$np_support/variants"
+np_variant_used=""
+np_conf_var_table=$(np_conf_normalise "$np_variant_conf_dir" "" variant) || np_conf_var_table=""
+np_conf_log "$np_conf_var_table" variants
+np_variant_say() {
+  echo "=== variants: $* ===" >> "${log:-/dev/null}" 2>&1 || true
+}
+
+# Mirrors np_compat_tool_builds in compat.c: the panel and the launch path have to agree
+# on which architecture a tool runs, or one offers a variant the other refuses.
+np_variant_arch() {
+  case "$np_flavor" in
+    (fex) printf 'aarch64' ;;
+    (*)   printf 'x86_64' ;;
+  esac
+}
+
+# ./lib/ and lib are the same place, as var_norm in webpatch.c reads them.
+np_variant_norm() {
+  printf '%s\n' "$1" | awk -F/ '{
+    o = ""
+    for (i = 1; i <= NF; i++) if ($i != "" && $i != ".") o = (o == "" ? $i : o "/" $i)
+    printf "%s", o
+  }'
+}
+
+# Whether a tree has anything this runner can use, read from the top of the tree the way
+# var_fits in webpatch.c reads it: files there land in dst, and each folder lands where dst
+# has one of the same name. A folder named for an architecture only counts for the runner
+# that runs it, and a tree naming any architecture has to land one this runner runs, or
+# arm64 Wine would be handed x86_64 files and never read them.
+np_variant_fits() {
+  np_v_lands=0
+  np_v_named=0
+  np_v_fits=0
+  np_v_want_arch=$(np_variant_arch)
+  np_v_into="$np_support/runners/crossover-$np_build/CrossOver/$2"
+  for np_v_e in "$1"/*; do
+    # The overlay copies regular files only, so a link never lands.
+    [ ! -L "$np_v_e" ] || continue
+    if [ -f "$np_v_e" ]; then
+      [ ! -d "$np_v_into" ] || np_v_lands=1
+      continue
+    fi
+    [ -d "$np_v_e" ] || continue
+    [ -n "$(find "$np_v_e" -name '.?*' -prune -o -type f -print -quit 2>/dev/null)" ] || continue
+    np_v_here=0
+    if [ -d "$np_v_into/${np_v_e##*/}" ]; then
+      np_v_here=1
+      np_v_lands=1
+    fi
+    np_v_d_arch=$(np_variant_dir_arch "${np_v_e##*/}")
+    [ -n "$np_v_d_arch" ] || continue
+    np_v_named=1
+    if [ "$np_v_here" = 1 ] && [ "$np_v_d_arch" = "$np_v_want_arch" ]; then
+      np_v_fits=1
+    fi
+  done
+  # A remove lands when the runner has what it names.
+  while IFS= read -r np_v_r; do
+    [ -n "$np_v_r" ] || continue
+    if [ -e "$np_v_into/$np_v_r" ] || [ -L "$np_v_into/$np_v_r" ]; then
+      np_v_lands=1
+    fi
+  done <<NP_V_REMOVES
+$np_v_removes
+NP_V_REMOVES
+  [ "$np_v_lands" = 1 ] && { [ "$np_v_named" = 0 ] || [ "$np_v_fits" = 1 ]; }
+}
+
+# Overwriting a file Wine ships ties a variant to its build. New files and DXMT or D3DMetal folders don't.
+np_variant_wine_hit() {
+  np_v_wbase="$np_support/runners/crossover-$np_build/CrossOver"
+  ( cd "$1" && find . -name '.?*' -prune -o -type f -print ) |
+    awk -v d="$(np_variant_norm "$2")" '{
+      sub(/^\.\//, ""); p = (d == "" ? $0 : d "/" $0)
+      if (tolower(p) ~ /^(bin|share\/wine|lib\/wine|lib64\/wine)\//) print p
+    }' |
+    while IFS= read -r np_v_w; do
+      if [ -f "$np_v_wbase/$np_v_w" ]; then
+        printf '%s' "$np_v_w"
+        break
+      fi
+    done
+}
+
+# The architecture a directory in a tree is for, empty when it names none. A runner can
+# hold more than one slot, so landing somewhere is not the same as being usable.
+np_variant_dir_arch() {
+  case "$1" in
+    (x86_64|x86_64-*)   printf 'x86_64' ;;
+    (aarch64|aarch64-*) printf 'aarch64' ;;
+    (i386|i386-*)       printf 'i386' ;;
+    (arm64ec|arm64ec-*) printf 'arm64ec' ;;
+  esac
+}
+
+# ntdll.dll carries the Steam bridge patch and ntdll.so has to match it, so variants keep off both and off lsteamclient.
+np_variant_bridge_hit() {
+  # APFS ignores case, so NTDLL.DLL is ntdll.dll.
+  np_v_nd=$(np_variant_norm "$2" | tr '[:upper:]' '[:lower:]')
+  np_v_nr=""
+  while IFS= read -r np_v_x; do
+    [ -n "$np_v_x" ] || continue
+    np_v_nr="$np_v_nr$(np_variant_norm "$np_v_nd/$np_v_x" | tr '[:upper:]' '[:lower:]')
+"
+  done <<NP_V_REMOVES
+$3
+NP_V_REMOVES
+  for np_v_slot in x86_64 i386 aarch64 arm64ec; do
+    for np_v_p in "lib/wine/$np_v_slot-windows/ntdll.dll" "lib/wine/$np_v_slot-windows/lsteamclient.dll" \
+                  "lib/wine/$np_v_slot-unix/ntdll.so" "lib/wine/$np_v_slot-unix/lsteamclient.so"; do
+      case "
+$np_v_nr" in
+        (*"
+$np_v_p
+"*) printf '%s' "$np_v_p"; return 0 ;;
+      esac
+    done
+  done
+  # A tree on a case-sensitive volume can't be probed by name, so every file gets read.
+  np_v_p=$( ( cd "$1" && find . -name '.?*' -prune -o -type f -print ) |
+    awk -v d="$np_v_nd" '{
+      sub(/^\.\//, ""); p = tolower(d == "" ? $0 : d "/" $0)
+      if (p ~ /^lib\/wine\/(x86_64|i386|aarch64|arm64ec)-(windows\/(ntdll|lsteamclient)\.dll|unix\/(ntdll|lsteamclient)\.so)$/) { print p; exit }
+    }')
+  [ -n "$np_v_p" ] || return 1
+  printf '%s' "$np_v_p"
+}
+
+# Requested names, split on +, sorted so a combination is named and overlaid the same way
+# whichever order it was asked for in.
+np_variant_names() {
+  printf '%s' "$1" | tr '+' '\n' | grep -v '^$' | LC_ALL=C sort -u | tr '\n' ' '
+}
+# "+" joins them because no build id or variant id can hold one, so no two requests and
+# no base runner share a directory.
+np_variant_dir_name() {
+  np_v_joined="crossover-$np_build"
+  for np_v_n in $1; do
+    np_v_joined="$np_v_joined+$np_v_n"
+  done
+  printf '%s' "$np_v_joined"
+}
+
+# Reads one descriptor into np_v_src and np_v_dst. Unknown keys are refused so a typo
+# cannot quietly mean something else, and a descriptor that cannot be used drops the
+# variant rather than stopping the game.
+np_variant_read() {
+  np_v_src=$(np_conf_value "$np_conf_var_table" "$1" src)
+  np_v_dst=$(np_conf_value "$np_conf_var_table" "$1" dst)
+  np_v_removes=$(np_conf_values "$np_conf_var_table" "$1" remove)
+  np_v_builds=$(np_conf_values "$np_conf_var_table" "$1" build)
+  if [ -z "$np_v_src" ] || [ -z "$np_v_dst" ]; then
+    np_variant_say "$1 has no usable descriptor"
+    return 1
+  fi
+  if [ -n "$np_v_builds" ] && ! printf '%s\n' "$np_v_builds" | grep -qxF "$np_build"; then
+    np_variant_say "$1 is for $(printf '%s' "$np_v_builds" | tr '\n' ' ') and this runner is $np_build, so it is left out"
+    return 1
+  fi
+  np_v_src=$(np_home_path "$np_v_src")
+  if [ ! -d "$np_v_src" ]; then
+    np_variant_say "$1 builds from $np_v_src, which is not there"
+    return 1
+  fi
+  if ! np_variant_fits "$np_v_src" "$np_v_dst"; then
+    np_variant_say "$1 has nothing for $np_v_want_arch that lands in this runner, so it is refused"
+    return 1
+  fi
+  if np_v_hit=$(np_variant_bridge_hit "$np_v_src" "$np_v_dst" "$np_v_removes"); then
+    np_variant_say "$1 would change $np_v_hit, which carries NotProton's Steam bridge, so it is refused"
+    return 1
+  fi
+  if [ -z "$np_v_builds" ] && np_v_hit=$(np_variant_wine_hit "$np_v_src" "$np_v_dst") \
+     && [ -n "$np_v_hit" ]; then
+    np_variant_say "$1 replaces $np_v_hit, which is Wine's own, so it has to name the build it was made for: build = $np_build"
+    return 1
+  fi
+  return 0
+}
+
+# What the variant should be made of. Rebuilding is decided by comparing this against the
+# copy recorded in the built runner, which is a handful of stat calls. The base runner's
+# patched files are in it too, or re-patching the runner would leave variants on the old ntdll.
+np_variant_manifest() {
+  for np_v_name in $1; do
+    np_variant_read "$np_v_name" || return 1
+    printf '%s %s\n' "$np_v_name" "$np_v_dst"
+    ( cd "$np_v_src" && find . -name '.?*' -prune -o -type f -exec stat -f '%N %z %m' {} + ) | LC_ALL=C sort
+    printf '%s\n' "$np_v_removes" | awk 'NF { print "remove " $0 }'
+  done
+  np_v_mbase="$np_support/runners/crossover-$np_build/CrossOver"
+  for np_v_bf in "$np_v_mbase/share/wine/wine.inf" \
+    "$np_v_mbase"/lib/wine/*-windows/ntdll.dll \
+    "$np_v_mbase"/lib/wine/*-windows/lsteamclient.dll \
+    "$np_v_mbase"/lib/wine/*-unix/lsteamclient.so; do
+    [ -f "$np_v_bf" ] || continue
+    stat -f 'base %N %d %i %z %m' "$np_v_bf" 2>/dev/null || true
+  done
+  return 0
+}
+
+# Sizes and times are left out, so rebuilding the same files doesn't rerun wine.inf in every prefix.
+np_variant_layout_of() {
+  awk '$1 == "base" { next } /^\.\// { sub(/ [0-9]+ [0-9]+$/, "") } { print }' | /sbin/md5 -q
+}
+
+# Wine keeps a wineserver running inside the runner, so a process running from there is a
+# live session and the tree under it must not move.
+np_variant_busy() {
+  # shellcheck disable=SC2009 # pgrep matches arguments; the executable path is the signal
+  np_v_ps=$(ps -axww -o comm= 2>/dev/null) || return 0
+  printf '%s\n' "$np_v_ps" | grep -qF "$1/"
+}
+
+# winebuild --builtin writes this over the DOS stub, and it is the whole reason a tree can
+# be shared as a zip: the mark travels in the file, so nobody downstream needs a toolchain.
+np_variant_builtin() {
+  [ "$(dd if="$1" bs=1 skip=64 count=16 2>/dev/null)" = "Wine builtin DLL" ]
+}
+
+np_variant_macho() {
+  case "$(od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n')" in
+    (cffaedfe | cefaedfe | feedfacf | feedface | cafebabe | bebafeca) return 0 ;;
+  esac
+  return 1
+}
+
+# arm64 won't load an edited Mach-O, and a replaced loader or wineserver needs the old file's entitlements back.
+np_variant_sign() {
+  if [ -n "$2" ]; then
+    printf '%s' "$2" > "$np_v_root/.np-entitlements.plist" || return 1
+    /usr/bin/codesign -f -s - --options runtime \
+      --entitlements "$np_v_root/.np-entitlements.plist" "$1" >> "${log:-/dev/null}" 2>&1 || return 1
+    rm -f "$np_v_root/.np-entitlements.plist"
+    return 0
+  fi
+  /usr/bin/codesign -v "$1" 2>/dev/null && return 0
+  /usr/bin/codesign -f -s - "$1" >> "${log:-/dev/null}" 2>&1
+}
+
+# A tree can hold more architectures than a runner has slots for -- DXMT builds one arch
+# per build directory but installs them into one prefix, so a shared tree may carry both.
+# A directory the runner does not have is skipped rather than fatal, and a variant that
+# lands nothing is refused, which is what catches a tree meant for the other machine.
+np_variant_overlay() {
+  np_v_root="$1"
+  : > "$np_v_root/.np-laid" || return 1
+  for np_v_name in $2; do
+    np_variant_read "$np_v_name" || return 1
+    np_v_nd=$(np_variant_norm "$np_v_dst")
+    ( cd "$np_v_src" && find . -name '.?*' -prune -o -type f -print ) > "$np_v_root/.np-files" || return 1
+
+    # Two variants touching one file is allowed (the later wins) but rarely meant.
+    {
+      awk -v d="$np_v_nd" '{ sub(/^\.\//, ""); print (d == "" ? $0 : d "/" $0) }' "$np_v_root/.np-files"
+      while IFS= read -r np_v_x; do
+        [ -z "$np_v_x" ] || { np_variant_norm "$np_v_nd/$np_v_x"; echo; }
+      done <<NP_V_REMOVES
+$np_v_removes
+NP_V_REMOVES
+    } > "$np_v_root/.np-mine"
+    np_v_clash=$(awk 'FILENAME == ARGV[1] { a[$0]; next } ($0 in a)' \
+      "$np_v_root/.np-laid" "$np_v_root/.np-mine" | head -3 | tr '\n' ' ')
+    [ -z "$np_v_clash" ] ||
+      np_variant_say "$np_v_name changes ${np_v_clash% } after an earlier variant did, and $np_v_name's copy is the one that runs"
+    cat "$np_v_root/.np-mine" >> "$np_v_root/.np-laid"
+
+    while IFS= read -r np_v_x; do
+      [ -n "$np_v_x" ] || continue
+      np_v_at="$np_v_root/CrossOver/$np_v_dst/$np_v_x"
+      if [ -L "$np_v_at" ] || [ -f "$np_v_at" ]; then
+        rm -f "$np_v_at" || return 1
+      elif [ -e "$np_v_at" ]; then
+        np_variant_say "$np_v_name: $np_v_x is a folder, and only files are removed, so it stays"
+      else
+        np_variant_say "$np_v_name: $np_v_x is not in this runner, so there is nothing to remove"
+      fi
+    done <<NP_V_REMOVES
+$np_v_removes
+NP_V_REMOVES
+
+    # Forks are what a Wine-sized tree costs, so the unlinks and quarantine strips go in batches.
+    : > "$np_v_root/.np-at"
+    : > "$np_v_root/.np-take"
+    np_v_skipped=""
+    while IFS= read -r np_v_rel; do
+      np_v_rel=${np_v_rel#./}
+      np_v_at="$np_v_root/CrossOver/$np_v_dst/$np_v_rel"
+      if [ ! -d "${np_v_at%/*}" ]; then
+        case "$np_v_rel" in */*) np_v_dir=${np_v_rel%/*} ;; *) np_v_dir=. ;; esac
+        case " $np_v_skipped " in
+          *" $np_v_dir "*) ;;
+          *) np_v_skipped="$np_v_skipped $np_v_dir" ;;
+        esac
+        continue
+      fi
+      printf '%s\n' "$np_v_rel" >> "$np_v_root/.np-take"
+      printf '%s\0' "$np_v_at" >> "$np_v_root/.np-at"
+    done < "$np_v_root/.np-files"
+    xargs -0 rm -f < "$np_v_root/.np-at" || return 1
+
+    np_v_laid=0
+    while IFS= read -r np_v_rel; do
+      np_v_at="$np_v_root/CrossOver/$np_v_dst/$np_v_rel"
+      # A DLL is never Mach-O, and everything else gets opened to check.
+      np_v_ent=""
+      np_v_lc=$(printf '%s' "${np_v_rel##*/}" | tr '[:upper:]' '[:lower:]')
+      np_v_signable=1
+      case "$np_v_lc" in (*.dll) np_v_signable=0 ;; esac
+      np_v_was="$np_support/runners/crossover-$np_build/CrossOver/$np_v_dst/$np_v_rel"
+      if [ "$np_v_signable" = 1 ] && [ -f "$np_v_was" ] && np_variant_macho "$np_v_was"; then
+        np_v_ent=$(/usr/bin/codesign -d --entitlements - --xml "$np_v_was" 2>/dev/null) || np_v_ent=""
+        case "$np_v_ent" in
+          # Ad-hoc signing can't carry Apple-granted entitlements like the FEX loader's cross-architecture-support.
+          (*'<key>com.apple.developer.'*)
+            np_variant_say "$np_v_name/$np_v_rel would replace a file holding an entitlement only Apple can sign for, so $np_v_name is refused"
+            return 1 ;;
+          (*'<key>'*) ;;
+          (*) np_v_ent="" ;;
+        esac
+      fi
+      cp -c "$np_v_src/$np_v_rel" "$np_v_at" 2>/dev/null \
+        || cp "$np_v_src/$np_v_rel" "$np_v_at" || return 1
+      case "$np_v_lc" in
+        *.dll)
+          if ! np_variant_builtin "$np_v_at"; then
+            np_variant_say "$np_v_name/$np_v_rel is not marked as a Wine builtin, so it would load as native and fail; $np_v_name is refused"
+            return 1
+          fi ;;
+      esac
+      if [ "$np_v_signable" = 1 ] && np_variant_macho "$np_v_at" \
+         && ! np_variant_sign "$np_v_at" "$np_v_ent"; then
+        np_variant_say "$np_v_name/$np_v_rel could not be signed and macOS would not load it, so $np_v_name is refused"
+        return 1
+      fi
+      np_v_laid=$(( np_v_laid + 1 ))
+    done < "$np_v_root/.np-take"
+    # A downloaded tree arrives quarantined and Gatekeeper can refuse to dlopen it.
+    xargs -0 xattr -d com.apple.quarantine < "$np_v_root/.np-at" 2>/dev/null || true
+    rm -f "$np_v_root/.np-files" "$np_v_root/.np-mine" "$np_v_root/.np-take" "$np_v_root/.np-at"
+    [ -z "$np_v_skipped" ] ||
+      np_variant_say "$np_v_name:$np_v_skipped has no counterpart in this runner, skipped"
+    if [ "$np_v_laid" -eq 0 ] && [ -z "$np_v_removes" ]; then
+      np_variant_say "nothing in $np_v_name belongs in this runner, so it is refused"
+      return 1
+    fi
+  done
+  rm -f "$np_v_root/.np-laid"
+  return 0
+}
+
+# Found before the clone, or a variant that can never build costs a whole runner copy every launch.
+np_variant_apple_hit() {
+  np_v_abase="$np_support/runners/crossover-$np_build/CrossOver"
+  for np_v_name in $1; do
+    np_variant_read "$np_v_name" || continue
+    np_v_ah=$( ( cd "$np_v_src" && find . -name '.?*' -prune -o -type f -print ) |
+      while IFS= read -r np_v_rel; do
+        np_v_rel=${np_v_rel#./}
+        np_v_was="$np_v_abase/$np_v_dst/$np_v_rel"
+        [ -f "$np_v_was" ] || continue
+        np_variant_macho "$np_v_was" || continue
+        case "$(/usr/bin/codesign -d --entitlements - --xml "$np_v_was" 2>/dev/null || true)" in
+          (*'<key>com.apple.developer.'*) printf '%s/%s' "$np_v_name" "$np_v_rel"; break ;;
+        esac
+      done)
+    [ -z "$np_v_ah" ] || { printf '%s' "$np_v_ah"; return 0; }
+  done
+}
+
+# Builds into a scratch directory and moves it in, so a failure leaves the previous build
+# standing and the game runs last-known-good rather than a half-written tree.
+# The lock is lockf's, held by a subshell, so it goes when the launch does however it ends
+# and nothing ever has to decide that a lock was left behind.
+np_variant_build() (
+  np_v_target="$1"
+  np_v_names="$2"
+  np_v_want="$3"
+  np_v_stem="$4"
+  np_v_base="$np_support/runners/crossover-$np_build"
+  # Hidden, as the app's own scratch is, so nothing that lists runners takes these for one.
+  np_v_scratch="${np_v_target%/*}/.${np_v_target##*/}"
+  np_v_lock="${np_v_stem%/*}/.${np_v_stem##*/}.lock"
+  np_v_new="$np_v_scratch.new"
+  np_v_old="$np_v_scratch.old"
+
+  if [ ! -d "$np_v_base/CrossOver/lib/wine" ]; then
+    np_variant_say "no base runner at $np_v_base yet, so nothing can be built from it"
+    exit 1
+  fi
+  [ ! -L "$np_v_lock" ] || exit 1
+  exec 7>> "$np_v_lock" || exit 1
+  if ! /usr/bin/lockf -s -t 120 7; then
+    np_variant_say "another launch is still building ${np_v_stem##*/}"
+    exit 1
+  fi
+  trap 'rm -rf "$np_v_new"; exit 143' TERM
+  trap 'rm -rf "$np_v_new"; exit 130' INT
+  trap 'rm -rf "$np_v_new"; exit 129' HUP
+
+  # Another launch may have built it, or started a game from it, while this one waited.
+  if [ -d "$np_v_target/CrossOver/lib/wine" ]; then
+    if [ "$(cat "$np_v_target/CrossOver/.notproton-variant" 2>/dev/null || true)" = "$np_v_want" ] \
+       && [ "${NOTPROTON_VARIANT_REBUILD:-}" != 1 ]; then
+      exit 0
+    fi
+    if np_variant_busy "$np_v_target"; then
+      np_variant_say "a game is running from ${np_v_target##*/}, leaving it as it is"
+      exit 0
+    fi
+  fi
+
+  rm -rf "$np_v_new" "$np_v_old"
+  np_v_hit=$(np_variant_apple_hit "$np_v_names")
+  if [ -n "$np_v_hit" ]; then
+    np_variant_say "$np_v_hit would replace a file holding an entitlement only Apple can sign for, so it is refused"
+    exit 1
+  fi
+  np_variant_say "building ${np_v_target##*/} from $np_v_names"
+  if ! { cp -c -R "$np_v_base" "$np_v_new" 2>/dev/null || cp -R "$np_v_base" "$np_v_new"; } \
+     || ! np_variant_overlay "$np_v_new" "$np_v_names" \
+     || ! printf '%s\n' "$np_v_want" > "$np_v_new/CrossOver/.notproton-variant" \
+     || ! : > "$np_v_new/.notproton-used"; then
+    rm -rf "$np_v_new"
+    np_variant_say "could not build ${np_v_target##*/}"
+    exit 1
+  fi
+  if [ -d "$np_v_target" ] && ! mv "$np_v_target" "$np_v_old"; then
+    rm -rf "$np_v_new"
+    np_variant_say "could not move the old ${np_v_target##*/} aside"
+    exit 1
+  fi
+  if ! mv "$np_v_new" "$np_v_target"; then
+    [ ! -d "$np_v_old" ] || mv "$np_v_old" "$np_v_target" || true
+    rm -rf "$np_v_new"
+    np_variant_say "could not move the new ${np_v_target##*/} in"
+    exit 1
+  fi
+  rm -rf "$np_v_old"
+  np_variant_say "built ${np_v_target##*/}"
+)
+
+# Newest build that worked, skipping any made before a re-patch since those carry the old Steam bridge.
+np_variant_last_good() {
+  np_v_base_now=$(printf '%s\n' "$2" | grep '^base ' || true)
+  # shellcheck disable=SC2012 # the names are ours, and ls is what sorts by time
+  ls -dt "$1"@*/.notproton-used 2>/dev/null | while IFS= read -r np_v_lg; do
+    np_v_lg=${np_v_lg%/.notproton-used}
+    [ -d "$np_v_lg/CrossOver/lib/wine" ] || continue
+    [ "$(grep '^base ' "$np_v_lg/CrossOver/.notproton-variant" 2>/dev/null || true)" = "$np_v_base_now" ] || continue
+    : > "$np_v_lg/.notproton-used" 2>/dev/null || continue
+    printf '%s' "$np_v_lg"
+    break
+  done
+}
+
+# Ten minutes covers a launch that resolved an old build but hasn't started Wine from it yet.
+np_variant_gc() {
+  np_variant_sweep "$1"
+  for np_v_old in "$1"@*; do
+    [ -d "$np_v_old" ] && [ "$np_v_old" != "$2" ] || continue
+    [ -z "$(find "$np_v_old/.notproton-used" -mmin -10 2>/dev/null)" ] || continue
+    np_variant_busy "$np_v_old" && continue
+    # Renamed first, so a kill partway can't leave half a runner under a name that gets reused.
+    np_v_trash="${np_v_old%/*}/.${np_v_old##*/}.removing"
+    mv "$np_v_old" "$np_v_trash" 2>/dev/null || continue
+    rm -rf "$np_v_trash" && np_variant_say "removed ${np_v_old##*/}, which nothing uses any more"
+  done
+}
+
+# What a killed build or cleanup left behind. Only touched with the build lock held, or it could be a live build's.
+np_variant_sweep() (
+  np_v_sw="${1%/*}/.${1##*/}"
+  for np_v_s in "$np_v_sw"@*.new "$np_v_sw"@*.old "$np_v_sw"@*.removing; do
+    [ -e "$np_v_s" ] || continue
+    [ ! -L "$np_v_sw.lock" ] || exit 0
+    exec 7>> "$np_v_sw.lock" || exit 0
+    /usr/bin/lockf -s -t 0 7 || exit 0
+    rm -rf "$np_v_sw"@*.new "$np_v_sw"@*.old "$np_v_sw"@*.removing
+    exit 0
+  done
+)
+
+# One name in a request that has lost its descriptor must not take the rest with it: the
+# panel keeps a launch option a game already carries, and a game outlives a descriptor.
+np_variant_usable() {
+  np_v_keep=""
+  np_v_drop=""
+  for np_v_name in $1; do
+    if np_variant_read "$np_v_name"; then
+      np_v_keep="$np_v_keep$np_v_name "
+    else
+      np_v_drop="$np_v_drop$np_v_name "
+    fi
+  done
+}
+
+# Sets np_variant_root to a runner carrying the requested variants, building it when the
+# trees behind it have moved on. Returns 1 to leave the game on the base runner, so a
+# stale launch option never stops it starting.
+np_variant_resolve() {
+  np_v_asked=$(np_variant_names "$1")
+  [ -n "$np_v_asked" ] || return 1
+  np_variant_usable "$np_v_asked"
+  [ -z "$np_v_drop" ] || np_variant_say "ignoring ${np_v_drop% }, which cannot be used"
+  [ -n "$np_v_keep" ] || return 1
+
+  np_v_sel=${np_v_keep% }
+  np_variant_used="$np_v_sel"
+  np_v_want=$(np_variant_manifest "$np_v_sel") || np_v_want=""
+  [ -n "$np_v_want" ] || return 1
+  np_v_stem="$np_support/runners/$(np_variant_dir_name "$np_v_sel")"
+  np_variant_key=${np_v_stem##*/crossover-"$np_build"}
+  # Named for its contents, so a rebuild never moves a runner out from under a running game.
+  np_variant_root="$np_v_stem@$(printf '%s\n' "$np_v_want" | /sbin/md5 -q | cut -c1-12)"
+  np_variant_layout=$(printf '%s\n' "$np_v_want" | np_variant_layout_of)
+
+  if [ ! -d "$np_variant_root/CrossOver/lib/wine" ] || [ "${NOTPROTON_VARIANT_REBUILD:-}" = 1 ] \
+     || [ "$(cat "$np_variant_root/CrossOver/.notproton-variant" 2>/dev/null || true)" != "$np_v_want" ]; then
+    if ! np_variant_build "$np_variant_root" "$np_v_sel" "$np_v_want" "$np_v_stem" \
+       && [ ! -d "$np_variant_root/CrossOver/lib/wine" ]; then
+      np_variant_root=$(np_variant_last_good "$np_v_stem" "$np_v_want")
+      [ -n "$np_variant_root" ] || return 1
+      np_variant_say "running ${np_variant_root##*/}, the last build of it that worked"
+      np_variant_layout=$(np_variant_layout_of < "$np_variant_root/CrossOver/.notproton-variant")
+    fi
+  fi
+  : > "$np_variant_root/.notproton-used" 2>/dev/null || true
+  np_variant_gc "$np_v_stem" "$np_variant_root"
+  np_variant_root="$np_variant_root/CrossOver"
+  return 0
+}
+
+# A variant can bring a module name the base runner never had. Prefixes are copied from a
+# template built before the variant existed, so that name has no entry in system32 and the
+# loader will not reach the runner's copy: a forward into it fails with "module not found"
+# and the first real call aborts the game. Putting the file in the prefix registers the
+# name. A name the prefix already has resolves on its own and is left as it is, which is
+# every DLL a variant merely replaces.
+np_variant_stage_prefix() {
+  [ -n "$np_variant_used" ] || return 0
+  np_v_want=$(np_variant_arch)
+  for np_v_name in $np_variant_used; do
+    np_variant_read "$np_v_name" || continue
+    for np_v_from in "$np_v_src"/*-windows/*.dll; do
+      [ -f "$np_v_from" ] || continue
+      np_v_rel=${np_v_from#"$np_v_src"/}
+      # The runner holds every architecture, the prefix only takes the one this tool runs.
+      np_v_d_arch=$(np_variant_dir_arch "${np_v_rel%%/*}")
+      case "$np_v_d_arch" in
+        (i386) ;;
+        (arm64ec) [ "$np_v_want" = aarch64 ] || continue ;;
+        (*) [ "$np_v_d_arch" = "$np_v_want" ] || continue ;;
+      esac
+      case "$np_v_rel" in
+        (i386-windows/*) np_v_into="$WINEPREFIX/drive_c/windows/syswow64" ;;
+        (*) np_v_into="$WINEPREFIX/drive_c/windows/system32" ;;
+      esac
+      # Copy what the runner ended up with, not the tree it was built from, and skip an
+      # architecture this runner has no slot for -- the same rule the overlay applies.
+      np_v_live="$CX_ROOT/$np_v_dst/$np_v_rel"
+      [ -f "$np_v_live" ] && [ -d "$np_v_into" ] || continue
+      np_v_reg="$np_v_into/${np_v_rel##*/}"
+      np_v_mark="${np_v_into##*/}/${np_v_rel##*/}"
+      # Only a file registered here is ours to refresh after a rebuild.
+      if [ -e "$np_v_reg" ]; then
+        grep -qxF "$np_v_mark" "$WINEPREFIX/.notproton-variant-modules" 2>/dev/null || continue
+        ! cmp -s "$np_v_live" "$np_v_reg" || continue
+      fi
+      if cp -f "$np_v_live" "$np_v_reg.np-stage.$$" && mv -f "$np_v_reg.np-stage.$$" "$np_v_reg"; then
+        grep -qxF "$np_v_mark" "$WINEPREFIX/.notproton-variant-modules" 2>/dev/null ||
+          echo "$np_v_mark" >> "$WINEPREFIX/.notproton-variant-modules" || true
+        np_variant_say "$np_v_name: registered ${np_v_rel##*/} in ${np_v_into##*/}"
+      else
+        rm -f "$np_v_reg.np-stage.$$"
+        np_variant_say "$np_v_name: could not register ${np_v_rel##*/} in ${np_v_into##*/}"
+      fi
+    done
+  done
+}
+
 CX_ROOT="$np_support/runners/crossover-$np_build/CrossOver"
+np_variant=${NOTPROTON_RUNNER_VARIANT:-}
+np_variant_key=""
+np_variant_layout=""
+case "$np_variant" in *[!A-Za-z0-9._+-]*) np_variant="" ;; esac
+if [ -n "$np_variant" ]; then
+  if np_variant_resolve "$np_variant"; then
+    CX_ROOT="$np_variant_root"
+  else
+    np_variant=""
+    np_variant_key=""
+    np_variant_layout=""
+    np_variant_used=""
+  fi
+fi
 export CX_ROOT
 # CrossOver initializes Rosetta's Windows thread-state support even without D3DMetal.
 if [ -f "$CX_ROOT/lib64/apple_gptk/external/libd3dshared.dylib" ]; then
@@ -197,11 +1173,45 @@ if [ "$verb" = waitforexitandrun ] && [ -f "$np_defaults_file" ] && [ -r "$np_de
       FEX_X87REDUCEDPRECISION=[01])
         [ "${wine_unix##*/}" = aarch64-unix ] || continue ;;
       MTL_HUD_ENABLED=[01] | DXMT_ENABLE_NVEXT=[01] | DXMT_METALFX_SPATIAL_SWAPCHAIN=[01] | \
-      WINEMSYNC=[01] | NOTPROTON_RETINA=[01] | NOTPROTON_RAW_CONTROLLERS=[01] | NOTPROTON_DISABLE_HIDRAW=[01]) ;;
+      WINEMSYNC=[01] | NOTPROTON_RETINA=[01] | NOTPROTON_RETINA_DPI=[01] | NOTPROTON_RAW_CONTROLLERS=[01] | NOTPROTON_DISABLE_HIDRAW=[01]) ;;
+      DXMT_CONFIG=*\;*)
+        dxmt_added=""
+        old_ifs=$IFS; IFS=";"
+        set -f
+        for clause in $value; do
+          case "$clause" in d3d11.metalSpatialUpscaleFactor=*)
+            case "${clause#*=}" in 1.5 | 1.72 | 2.0 | 3.0) ;; *) continue ;; esac
+            if ! printf '%s' "${DXMT_CONFIG-}" | tr ';' '\n' \
+              | grep -q '^[[:space:]]*d3d11\.metalSpatialUpscaleFactor[[:space:]]*='; then
+              export DXMT_CONFIG="${DXMT_CONFIG:+$DXMT_CONFIG;}$clause"
+              dxmt_added="${dxmt_added:+$dxmt_added;}$clause"
+            fi ;;
+          d3d11.preferredMaxFrameRate=*)
+            case "${clause#*=}" in 30 | 40 | 60 | 120 | 144) ;; *) continue ;; esac
+            if ! printf '%s' "${DXMT_CONFIG-}" | tr ';' '\n' \
+              | grep -q '^[[:space:]]*d3d11\.preferredMaxFrameRate[[:space:]]*='; then
+              export DXMT_CONFIG="${DXMT_CONFIG:+$DXMT_CONFIG;}$clause"
+              dxmt_added="${dxmt_added:+$dxmt_added;}$clause"
+            fi ;; esac
+        done
+        set +f; IFS=$old_ifs
+        if [ -n "$dxmt_added" ]; then
+          np_defaulted="$np_defaulted${np_defaulted:+ }DXMT_CONFIG=$dxmt_added"
+        fi
+        continue ;;
       DXMT_CONFIG=d3d11.metalSpatialUpscaleFactor=*)
         case "${value#*=}" in 1.5 | 1.72 | 2.0 | 3.0) ;; *) continue ;; esac
         if printf '%s' "${DXMT_CONFIG-}" | tr ';' '\n' \
           | grep -q '^[[:space:]]*d3d11\.metalSpatialUpscaleFactor[[:space:]]*='; then
+          continue
+        fi
+        export DXMT_CONFIG="${DXMT_CONFIG:+$DXMT_CONFIG;}$value"
+        np_defaulted="$np_defaulted${np_defaulted:+ }$line"
+        continue ;;
+      DXMT_CONFIG=d3d11.preferredMaxFrameRate=*)
+        case "${value#*d3d11.preferredMaxFrameRate=}" in 30 | 40 | 60 | 120 | 144) ;; *) continue ;; esac
+        if printf '%s' "${DXMT_CONFIG-}" | tr ';' '\n' \
+          | grep -q '^[[:space:]]*d3d11\.preferredMaxFrameRate[[:space:]]*='; then
           continue
         fi
         export DXMT_CONFIG="${DXMT_CONFIG:+$DXMT_CONFIG;}$value"
@@ -242,17 +1252,11 @@ without_lock_fds() {
   "$@" 8>&- 9>&-
 }
 
+user_dllpath="${WINEDLLPATH:-}"
 # If two WINEDLLPATH directories have the same DLL, Wine uses the one listed first.
 export WINEDLLPATH="$CX_ROOT/lib/wine/x86_64-windows:$wine_unix${WINEDLLPATH:+:$WINEDLLPATH}"
 export PATH="$CX_ROOT/bin:$PATH"
 
-if [ -n "$STEAM_COMPAT_DATA_PATH" ]; then
-  log="$STEAM_COMPAT_DATA_PATH/notproton-run.log"
-else
-  log=/dev/null
-fi
-[ "$(stat -f %z "$log" 2>/dev/null || echo 0)" -gt 262144 ] \
-  && : > "$log" || true
 {
   echo "=== notproton run $(date) ==="
   echo "verb=$verb"
@@ -516,6 +1520,7 @@ last_wine_build() {
   had_build=other
   had_display="another version of CrossOver"
   for inf in "$np_support"/runners/crossover-*/CrossOver/share/wine/wine.inf; do
+    [ ! -e "${inf%/share/wine/wine.inf}/.notproton-variant" ] || continue
     [ "$(stat -f %m "$inf" 2>/dev/null)" = "$updated" ] || continue
     if [ "$had_build" != other ]; then
       had_build=other
@@ -619,6 +1624,21 @@ offer_switch_rebuild() {
 
 Rebuild your prefix for $(running_name "$np_display" "$(tool_name "$now_arch")")? Your save games will be preserved and not lost." \
     "Launch Without Rebuilding"
+}
+
+# Wine reruns wine.inf only when its mtime changes, which swapping a variant's files doesn't do.
+note_variant_switch() {
+  record="$STEAM_COMPAT_DATA_PATH/notproton-variant"
+  had=$(cat "$record" 2>/dev/null || true)
+  if [ "$had" != "$np_variant_layout" ] && [ -f "$WINEPREFIX/system.reg" ]; then
+    printf '0\n' > "$WINEPREFIX/.update-timestamp" 2>/dev/null || true
+    echo "=== runner variant files changed (${had:-none} to ${np_variant_layout:-none}), wine.inf reruns ===" >> "$log" 2>&1 || true
+  fi
+  if [ -n "$np_variant_layout" ]; then
+    printf '%s\n' "$np_variant_layout" > "$record" 2>/dev/null || true
+  else
+    rm -f "$record"
+  fi
 }
 
 claim_prefix() {
@@ -834,8 +1854,14 @@ plan_hidden_controllers() {
   owned=""
   [ ! -f "$controllers_file" ] || owned=$(sed -n '/^[0-9a-f]\{4\}\/[0-9a-f]\{4\}$/p' "$controllers_file")
   in_registry=""
-  [ ! -f "$WINEPREFIX/system.reg" ] || in_registry=$(tr '[:upper:]' '[:lower:]' < "$WINEPREFIX/system.reg" \
-    | sed -n 's/^\[system\\\\controlset001\\\\services\\\\winebus\\\\devices\\\\\([0-9a-f]\{4\}\/[0-9a-f]\{4\}\)\].*/\1/p' \
+  [ ! -f "$WINEPREFIX/system.reg" ] || in_registry=$(LC_ALL=C awk '
+    /^\[/ {
+      line = tolower($0)
+      prefix = "[system\\\\controlset001\\\\services\\\\winebus\\\\devices\\\\"
+      if (index(line, prefix) != 1) next
+      id = substr(line, length(prefix) + 1, 9)
+      if (id ~ /^[0-9a-f]{4}\/[0-9a-f]{4}$/ && substr(line, length(prefix) + 10, 1) == "]") print id
+    }' "$WINEPREFIX/system.reg" \
     | sort -u)
   if [ "$NOTPROTON_RAW_CONTROLLERS" != "1" ]; then
     controllers_wanted=$(ids_without "$(controller_ids "$SDL_GAMECONTROLLER_IGNORE_DEVICES")" \
@@ -860,9 +1886,9 @@ plan_disable_hidraw() {
   hidraw_value=""
   [ -n "$STEAM_COMPAT_DATA_PATH" ] && [ ! -L "$hidraw_file" ] || return 1
   hidraw_set=""
-  [ ! -f "$WINEPREFIX/system.reg" ] || hidraw_set=$(tr '[:upper:]' '[:lower:]' < "$WINEPREFIX/system.reg" \
-    | awk '/^\[/ { s = index($0, "[system\\\\controlset001\\\\services\\\\winebus]") == 1; next }
-      s && $0 == "\"disablehidraw\"=dword:00000001" { print 1; exit }')
+  [ ! -f "$WINEPREFIX/system.reg" ] || hidraw_set=$(LC_ALL=C awk '
+      /^\[/ { s = index(tolower($0), "[system\\\\controlset001\\\\services\\\\winebus]") == 1; next }
+      s && tolower($0) == "\"disablehidraw\"=dword:00000001" { print 1; exit }' "$WINEPREFIX/system.reg")
   if [ "$NOTPROTON_DISABLE_HIDRAW" = "1" ]; then
     [ -n "$hidraw_set" ] || hidraw_value='"DisableHidraw"=dword:00000001'
   elif [ -f "$hidraw_file" ] && [ -n "$hidraw_set" ]; then
@@ -875,23 +1901,30 @@ winebus_lines() {
   printf '%s\r\n' '[HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\WineBus]' "$hidraw_value" ''
 }
 
-# High Resolution doubles LogPixels and turning it off halves it
+# High Resolution doubles LogPixels and turning it off halves it.
+# NOTPROTON_RETINA_DPI=0 leaves it alone, since Wine shrinks the screen for games that are not DPI aware.
 plan_logpixels() {
   dpi_value=""
   new_dpi=""
+  [ "${NOTPROTON_RETINA_DPI-}" != 0 ] || return 0
+  dpi_registry=/dev/null
+  [ ! -f "$WINEPREFIX/user.reg" ] || dpi_registry="$WINEPREFIX/user.reg"
   read -r retina_was dpi <<EOF
-$({ [ ! -f "$WINEPREFIX/user.reg" ] || tr '[:upper:]' '[:lower:]' < "$WINEPREFIX/user.reg"; } | awk '
+$(LC_ALL=C awk '
   /^\[/ { s = 0
-    if (index($0, "[software\\\\wine\\\\mac driver]") == 1) s = 1
-    else if (index($0, "[control panel\\\\desktop]") == 1) s = 2
+    line = tolower($0)
+    if (index(line, "[software\\\\wine\\\\mac driver]") == 1) s = 1
+    else if (index(line, "[control panel\\\\desktop]") == 1) s = 2
     next }
+  s { $0 = tolower($0) }
   s == 1 && $0 ~ /^"retinamode"="[yt1]/ { r = 1 }
   s == 2 && $0 ~ /^"logpixels"=dword:[0-9a-f]+$/ && length($0) <= 26 { d = substr($0, 19) }
-  END { print r + 0, d }')
+  END { print r + 0, d }' "$dpi_registry")
 EOF
-  [ -n "$dpi" ] || [ ! -f "$WINEPREFIX/system.reg" ] || dpi=$(tr '[:upper:]' '[:lower:]' < "$WINEPREFIX/system.reg" \
-    | awk '/^\[/ { s = index($0, "[system\\\\controlset001\\\\hardware profiles\\\\current\\\\software\\\\fonts]") == 1; next }
-      s && $0 ~ /^"logpixels"=dword:[0-9a-f]+$/ && length($0) <= 26 { print substr($0, 19); exit }')
+  [ -n "$dpi" ] || [ ! -f "$WINEPREFIX/system.reg" ] || dpi=$(LC_ALL=C awk '
+      /^\[/ { s = index(tolower($0), "[system\\\\controlset001\\\\hardware profiles\\\\current\\\\software\\\\fonts]") == 1; next }
+      s { $0 = tolower($0) }
+      s && $0 ~ /^"logpixels"=dword:[0-9a-f]+$/ && length($0) <= 26 { print substr($0, 19); exit }' "$WINEPREFIX/system.reg")
   dpi=$((0x${dpi:-0}))
   [ "$dpi" -gt 0 ] || dpi=96
   if [ "$NOTPROTON_RETINA" = "1" ]; then
@@ -908,6 +1941,69 @@ video_lines() {
   printf '%s\r\n' '[HKEY_CURRENT_USER\Software\Wine\Mac Driver]' "$retina_line" ''
   [ -n "$dpi_value" ] || return 0
   printf '%s\r\n' '[HKEY_CURRENT_USER\Control Panel\Desktop]' "$dpi_value" ''
+}
+
+prefix_up_to_date() {
+  [ -r "$WINEPREFIX/.update-timestamp" ] || return 1
+  read -r stamp _ < "$WINEPREFIX/.update-timestamp" || return 1
+  stamp=${stamp%"$(printf '\r')"}
+  case "$stamp" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$stamp" = "$(stat -f %m "$CX_ROOT/share/wine/wine.inf" 2>/dev/null)" ]
+}
+
+# Proton only writes the registry when its prefix version changes.
+settings_already_applied() {
+  prefix_up_to_date || return 1
+  [ -f "$WINEPREFIX/system.reg" ] && [ -f "$WINEPREFIX/user.reg" ] || return 1
+  LC_ALL=C awk '
+    function double(s,   out, i) {
+      out = ""
+      while ((i = index(s, "\\")) > 0) { out = out substr(s, 1, i) "\\"; s = substr(s, i + 1) }
+      return out s
+    }
+    FNR == 1 {
+      file++
+      root = file == 2 ? "hkey_local_machine\\" : "hkey_current_user\\"
+      key = ""
+    }
+    { sub(/\r$/, "") }
+    /^\[/ {
+      key = ""
+      end = index($0, "]")
+      if (!end) { if (file == 1) bad = 1; next }
+      name = tolower(substr($0, 2, end - 2))
+      if (file == 1) {
+        deleted = sub(/^-/, "", name)
+        ccs = "hkey_local_machine\\system\\currentcontrolset\\"
+        if (index(name, ccs) == 1)
+          name = "hkey_local_machine\\system\\controlset001\\" substr(name, length(ccs) + 1)
+        split(name, part, "\\")
+        name = substr(name, 1, length(part[1]) + 1) double(substr(name, length(part[1]) + 2))
+        if (deleted) gone[name] = 1
+        else { key = name; wanted[name] = 1 }
+        next
+      }
+      name = root name
+      for (g in gone) if (name == g || index(name, g "\\\\") == 1) bad = 1
+      if (name in wanted) key = name
+      next
+    }
+    key == "" || !match($0, /^("([^"\\]|\\.)*"|@)=/) { next }
+    {
+      name = tolower(substr($0, 1, RLENGTH - 1))
+      value = substr($0, RLENGTH + 1)
+      if (file == 1) want[key, name] = value
+      else have[key, name] = value
+    }
+    END {
+      if (file != 3) exit 1
+      for (kv in want) {
+        if (want[kv] == "-") { if (kv in have) bad = 1 }
+        else if (!(kv in have) || have[kv] != want[kv]) bad = 1
+      }
+      exit bad
+    }
+  ' "$settings_file" "$WINEPREFIX/system.reg" "$WINEPREFIX/user.reg"
 }
 
 import_prefix_settings() {
@@ -959,8 +2055,13 @@ import_prefix_settings() {
     without_lock_fds "$WINELOADER" wineboot --init >> "$log" 2>&1 || true
     return 0
   fi
-  without_lock_fds "$WINELOADER" reg import "C:\\${settings_file##*/}" >> "$log" 2>&1 \
-    && import_status=0 || import_status=$?
+  if settings_already_applied; then
+    import_status=0
+    echo "=== prefix settings already applied, skipped the import ===" >> "$log" 2>&1 || true
+  else
+    without_lock_fds "$WINELOADER" reg import "C:\\${settings_file##*/}" >> "$log" 2>&1 \
+      && import_status=0 || import_status=$?
+  fi
   rm -f "$settings_file"
   if [ "$import_status" -eq 0 ] && [ "$hidraw_planned" -eq 1 ] && [ "$NOTPROTON_DISABLE_HIDRAW" != "1" ]; then
     rm -f "$hidraw_file"
@@ -996,6 +2097,15 @@ if [ -z "$np_build" ] || [ ! -d "$CX_ROOT/lib/wine" ]; then
   exit 1
 fi
 echo "runner: build $np_build ($np_display) at $CX_ROOT" >> "$log" 2>&1 || true
+if [ -n "${NOTPROTON_RUNNER_VARIANT:-}" ]; then
+  if [ -n "$np_variant_used" ]; then
+    echo "runner: variant asked for $NOTPROTON_RUNNER_VARIANT, using $np_variant_used" \
+      >> "$log" 2>&1 || true
+  else
+    echo "=== runner variant ${NOTPROTON_RUNNER_VARIANT} not installed, using the base runner ===" \
+      >> "$log" 2>&1 || true
+  fi
+fi
 
 # Each CrossOver build needs its own template.
 # FEX builds need two, one for FEX/arm64 Wine and one for Rosetta/AMD64 Wine
@@ -1244,7 +2354,8 @@ seed_prefix_from_template() {
     echo "=== prefix templates are busy, wine builds this prefix itself ===" >> "$log" 2>&1 || true
     return 0
   fi
-  template_dir="$template_cache/$runner_id"
+  # Variants get their own template slot or they'd keep evicting the stock runner's.
+  template_dir="$template_cache/$runner_id$np_variant_key"
   if [ -L "$template_cache" ] || [ -L "$template_dir" ] \
     || ! mkdir -p "$template_dir"; then exec 9>&-; return 0; fi
   if ! identity=$(template_identity); then exec 9>&-; return 0; fi
@@ -1386,12 +2497,14 @@ link_fonts() {
   for dir in "$np_support/fonts" "$CX_ROOT/share/wine/fonts"; do
     for src in "$dir"/*.ttf "$dir"/*.ttc; do
       [ -f "$src" ] || continue
-      name=$(basename "$src")
+      name=${src##*/}
       case "$app_id:$name" in
         1313860:arial.ttf|1506830:arial.ttf) src="$dir/alt/$name" ;;
       esac
       dst="$fonts_dir/$name"
-      if [ -L "$dst" ]; then
+      if [ -L "$dst" ] && [ "$dst" -ef "$src" ]; then
+        :
+      elif [ -L "$dst" ]; then
         rm -f "$dst" && ln -s "$src" "$dst" 2>> "$log" || true
       elif [ ! -e "$dst" ]; then
         ln -s "$src" "$dst" 2>> "$log" || true
@@ -1433,6 +2546,7 @@ if [ -n "$STEAM_COMPAT_DATA_PATH" ]; then
   stage_step="prefix arch check"
   refuse_foreign_prefix
   claim_prefix
+  note_variant_switch
   stage_step="prefix switch check"
   offer_switch_rebuild
   echo "sync: WINEMSYNC=$WINEMSYNC from $msync_from" >> "$log" 2>&1 || true
@@ -1442,6 +2556,7 @@ if [ -n "$STEAM_COMPAT_DATA_PATH" ]; then
     echo "avx: ROSETTA_ADVERTISE_AVX=$ROSETTA_ADVERTISE_AVX from $avx_from" >> "$log" 2>&1 || true
   fi
   without_lock_fds "$WINESERVER" -k >> "$log" 2>&1 || true
+  without_lock_fds "$WINESERVER" -w >> "$log" 2>&1 || true
   stage_step="prefix seed"
   seed_prefix_from_template
   stage_step="profile layout"
@@ -1456,6 +2571,8 @@ if [ -n "$STEAM_COMPAT_DATA_PATH" ]; then
   import_prefix_settings
   stage_step="fonts"
   link_fonts
+  stage_step="variant modules"
+  np_variant_stage_prefix
   # A prefix that Wine built just now only has dosdevices from this point on.
   stage_step="game drive"
   map_game_drive
@@ -1523,7 +2640,7 @@ install_legacycompat() {
   mkdir -p "$dst" || return 0
   for f in "$src"/*; do
     [ -f "$f" ] || continue
-    b=$(basename "$f")
+    b=${f##*/}
     cmp -s "$f" "$dst/$b" && continue
     if cp -c -f "$f" "$dst/$b" 2>> "$log"; then
       echo "=== installed legacycompat/$b ===" >> "$log" 2>&1 || true
@@ -1618,11 +2735,14 @@ if [ -d "$bridge_src" ] && [ -n "$WINEPREFIX" ]; then
   fi
   for f in "$prefix_steam"/*.dll "$prefix_steam"/*.so "$prefix_steam"/*.exe; do
     [ -f "$f" ] || continue
+    base=${f##*/}
     case " $bridge_files " in
-      *" $(basename "$f") "*) ;;
-      *) rm -f "$f" && echo "=== pruned stale $(basename "$f") ===" >> "$log" 2>&1 ;;
+      *" $base "*) ;;
+      *) rm -f "$f" && echo "=== pruned stale $base ===" >> "$log" 2>&1 ;;
     esac
   done
+  # Needed for CEG 'platform survey'.
+  mkdir -p "$WINEPREFIX/drive_c/windows/system32/config" 2>/dev/null || true
   verify_runner
   if ! install_lsteamclient_trigger; then
     show_alert "Steam files could not be copied" "NotProton could not copy a file into this game's prefix. Open this prefix's notproton-run.log for details."
@@ -1691,11 +2811,7 @@ if [ -z "$game_name" ] && [ -f "$manifest" ]; then
 fi
 [ -z "$game_name" ] && game_name=$(basename "$STEAM_COMPAT_INSTALL_PATH")
 [ -z "$game_name" ] && game_name="Steam Game"
-# shellcheck disable=SC1003 # the pair deletes a literal backslash, not a quote
-bundle_name=$(printf '%s' "$game_name" | tr -d '/:"`$\\')
-bundle_name=${bundle_name#"${bundle_name%%[!.]*}"}
-[ -n "$bundle_name" ] || bundle_name="Steam Game"
-game_name_xml=$(printf '%s' "$game_name" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')
+np_game_names
 loader_root="$HOME/Library/Application Support/notproton/launchers/$app_id"
 mkdir -p "$loader_root"
 loader_app="$loader_root/$bundle_name.app"
@@ -1714,53 +2830,72 @@ if resolve_icon && cp -f "$icon_cache" "$loader_res/game.icns"; then
 fi
 [ -n "$icon_arg" ] || echo "no icon resolved, launching without one" >> "$log" 2>&1 || true
 
+game_runner=""
+display_name_xml=$game_name_xml
+localized_arg=""
 uielement_arg=""
-if [ "${NOTPROTON_HIDE_LAUNCHER_TILE:-0}" = "1" ]; then
+if [ -z "$user_dllpath" ]; then
+  game_runner="$loader_root/runner"
+  game_app="$game_runner/lib/wine/${wine_unix##*/}/wine.app"
+  # Begone, unwanted Wine processes! Stay out of my dock!
+  uielement_arg="  <key>LSUIElement</key><true/>"
+  # Trickery so that the running application (as shown in the dock) is shown with the game's name
+  display_name_xml=wine
+  localized_arg="  <key>LSHasLocalizedDisplayName</key><true/>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>"
+elif [ "${NOTPROTON_HIDE_LAUNCHER_TILE:-0}" = "1" ]; then
   uielement_arg="  <key>LSUIElement</key><true/>"
   echo "launcher tile hidden by NOTPROTON_HIDE_LAUNCHER_TILE" >> "$log" 2>&1 || true
 fi
-cat > "$loader_contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleName</key><string>$game_name_xml</string>
-  <key>CFBundleDisplayName</key><string>$game_name_xml</string>
-  <key>CFBundleIdentifier</key><string>com.notproton.launcher.$app_id</string>
-  <key>CFBundleExecutable</key><string>launcher</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-  <key>LSApplicationCategoryType</key><string>public.app-category.games</string>
-  <key>NSHighResolutionCapable</key><true/>
-  <key>NSPrincipalClass</key><string>NSApplication</string>
-  <key>NSMicrophoneUsageDescription</key><string>This game would like to access your microphone.</string>
-  <key>NSCameraUsageDescription</key><string>This game would like to access your camera.</string>
-  <key>NSLocalNetworkUsageDescription</key><string>This game would like to access devices on your local network.</string>
+if [ -n "$localized_arg" ]; then
+  game_name_strings=$(printf '%s' "$game_name" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+  for lproj in en Base; do
+    mkdir -p "$loader_res/$lproj.lproj"
+    printf '"CFBundleDisplayName" = "%s";\n' "$game_name_strings" > "$loader_res/$lproj.lproj/InfoPlist.strings"
+  done
+fi
+steam_url="steam://rungameid/$app_id"
+if shortcut_game_id "$SteamGameId"; then steam_url="steam://rungameid/$SteamGameId"; fi
+if [ -n "$game_runner" ]; then
+  runner_games_arg=$games_arg
+  if np_game_mode_by_key; then runner_games_arg="  <key>LSSupportsGameMode</key><true/>"; fi
+  runner_plist="$loader_work/runner.plist"
+  bundle_plist "$display_name_xml" "com.notproton.launcher.$app_id" wine \
+    "$runner_games_arg
 $uielement_arg
-$icon_arg
-</dict>
-</plist>
-PLIST
-
-# Invokes macOS Game Mode
-for f in "$wine_unix"/*; do
-  [ -e "$f" ] || continue
-  base=${f##*/}
-  case "$base" in
-    wine|wine.app) continue ;;
-  esac
-  ln -sfn "$f" "$loader_macos/$base"
-done
-ln "$WINELOADER" "$loader_macos/wine" 2>/dev/null || cp "$WINELOADER" "$loader_macos/wine"
-if [ -x "$loader_macos/wine" ]; then
-  WINELOADER="$loader_app/Contents/MacOS/wine"
-  echo "loader staged in bundle for game mode" >> "$log" 2>&1 || true
+$localized_arg" > "$runner_plist"
+  np_tile "$loader_contents" "$app_id" "$steam_url"
 else
-  echo "loader staging failed, game mode unavailable" >> "$log" 2>&1 || true
+  bundle_plist "$display_name_xml" "com.notproton.launcher.$app_id" launcher \
+    "$games_arg
+$uielement_arg" > "$loader_contents/Info.plist"
 fi
 
-cat > "$loader_macos/launcher" <<LAUNCHER
+# Invokes macOS Game Mode
+if [ -z "$game_runner" ]; then
+  (
+    set --
+    for f in "$wine_unix"/*; do
+      [ -e "$f" ] || continue
+      base=${f##*/}
+      case "$base" in
+        wine|wine.app) continue ;;
+      esac
+      set -- "$@" "$f"
+    done
+    [ "$#" -eq 0 ] || ln -sfn "$@" "$loader_macos/"
+  )
+  ln "$WINELOADER" "$loader_macos/wine" 2>/dev/null || cp "$WINELOADER" "$loader_macos/wine"
+  if [ -x "$loader_macos/wine" ]; then
+    WINELOADER="$loader_app/Contents/MacOS/wine"
+    echo "loader staged in bundle for game mode" >> "$log" 2>&1 || true
+  else
+    echo "loader staging failed, game mode unavailable" >> "$log" 2>&1 || true
+  fi
+
+  cat > "$loader_macos/launcher" <<LAUNCHER
 #!/bin/sh
+$(np_handoff "$steam_url")
 export WINELOADER="$WINELOADER"
 wine_log="$loader_root/notproton-wine.log"
 exec > "\$wine_log" 2>&1
@@ -1773,11 +2908,14 @@ if [ -n "\$STEAM_DYLD_INSERT_LIBRARIES" ]; then
     export DYLD_INSERT_LIBRARIES="\$STEAM_DYLD_INSERT_LIBRARIES"
   fi
 fi
+if [ -n "\$NOTPROTON_FEATURE_DYLIBS" ]; then
+  export DYLD_INSERT_LIBRARIES="\${DYLD_INSERT_LIBRARIES:+\$DYLD_INSERT_LIBRARIES:}\$NOTPROTON_FEATURE_DYLIBS"
+fi
 [ -n "\$NOTPROTON_GAME_CWD" ] && cd "\$NOTPROTON_GAME_CWD"
-"$WINELOADER" "\$@"
-exit \$?
+exec "$WINELOADER" "\$@"
 LAUNCHER
-chmod +x "$loader_macos/launcher"
+  chmod +x "$loader_macos/launcher"
+fi
 
 bundle_listing() {
   (cd "$1" && find . | LC_ALL=C sort | while IFS= read -r p; do
@@ -1790,13 +2928,23 @@ bundle_listing() {
     fi
   done)
 }
+bundle_matches() {
+  if [ -x "$np_support/appinfo" ]; then
+    if "$np_support/appinfo" --same-bundle "$1" "$2" 2>/dev/null; then
+      return 0
+    else
+      case "$?" in 1) return 1 ;; esac
+    fi
+  fi
+  [ "$(bundle_listing "$1")" = "$(bundle_listing "$2")" ]
+}
 install_bundle() (
   exec 7>> "$loader_root/.lock"
   /usr/bin/lockf -s -t 30 7 || exit 1
   same=""
   for b in "$loader_root"/*.app; do
     if [ "$b" = "$loader_app" ] && [ -d "$b" ] && [ ! -L "$b" ] &&
-       [ "$(bundle_listing "$b")" = "$(bundle_listing "$loader_stage")" ]; then
+       bundle_matches "$b" "$loader_stage"; then
       same=1
     fi
   done
@@ -1840,7 +2988,72 @@ install_bundle() (
   fi
   rm -rf "$loader_work" || true
 )
-install_bundle
+runner_stamp() {
+  if [ -d "$wine_unix/wine.app" ]; then
+    set -- "$wine_unix/wine.app/Contents" "$wine_unix/wine.app/Contents/MacOS" \
+      "$wine_unix/wine.app/Contents/MacOS/wine"
+  else
+    set -- "$wine_unix/wine" "$wine_unix/ntdll.so"
+  fi
+  stat -f '%N %i %Fm' "$CX_ROOT/lib/wine" "$CX_ROOT/lib/wine"/* "$@"
+}
+install_game_runner() (
+  exec 7>> "$loader_root/.lock"
+  /usr/bin/lockf -s -t 30 7 || exit 1
+  stamp=$(runner_stamp) || exit 1
+  if [ "$(cat "$game_runner/.stamp" 2>/dev/null)" != "$stamp" ]; then
+    clone="$loader_work/runner"
+    mkdir -p "$clone/lib" || exit 1
+    for f in "$CX_ROOT"/*; do
+      [ "${f##*/}" = lib ] || ln -s "$f" "$clone/${f##*/}" || exit 1
+    done
+    for f in "$CX_ROOT/lib"/*; do
+      [ "${f##*/}" = wine ] || ln -s "$f" "$clone/lib/${f##*/}" || exit 1
+    done
+    cp -cR "$CX_ROOT/lib/wine" "$clone/lib/wine" || exit 1
+    clone_app="$clone/lib/wine/${wine_unix##*/}/wine.app"
+    if [ ! -d "$clone_app" ]; then
+      mkdir -p "$clone_app/Contents/MacOS" || exit 1
+      cp -c "$wine_unix/wine" "$clone_app/Contents/MacOS/wine" || exit 1
+      # CrossOver 26's wine only looks for ntdll.so right next to itself
+      for f in "${clone_app%/*}"/*; do
+        case "${f##*/}" in wine|wine.app) continue ;; esac
+        ln -s "../../../${f##*/}" "$clone_app/Contents/MacOS/${f##*/}" || exit 1
+      done
+    fi
+    rm -rf "$clone_app/Contents/_CodeSignature" || exit 1
+    if [ -d "$clone/lib/wine/aarch64-windows" ]; then
+      cp -c "$clone/lib/wine/x86_64-windows/lsteamclient.dll" "$clone/lib/wine/aarch64-windows/" || exit 1
+    fi
+    printf '%s\n' "$stamp" > "$clone/.stamp" || exit 1
+    rm -rf "$game_runner" && mv "$clone" "$game_runner" || exit 1
+    /usr/bin/tmutil addexclusion "$game_runner" >> "$log" 2>&1 || true
+    echo "cloned $CX_ROOT for this game" >> "$log" 2>&1 || true
+  fi
+  contents="$game_app/Contents"
+  if cmp -s "$runner_plist" "$contents/Info.plist" &&
+     [ "$(bundle_listing "$loader_res")" = "$(bundle_listing "$contents/Resources")" ]; then
+    echo "game's wine.app already up to date" >> "$log" 2>&1 || true
+  else
+    rm -rf "$contents/Resources" || exit 1
+    cp -R "$loader_res" "$contents/Resources" || exit 1
+    cp "$runner_plist" "$contents/Info.plist" || exit 1
+    echo "game's wine.app updated" >> "$log" 2>&1 || true
+  fi
+  for b in "$loader_root"/*.app "$loader_root"/.[!.]*.app; do
+    if [ "$b" != "$loader_app" ] && { [ -e "$b" ] || [ -L "$b" ]; }; then rm -rf "$b" || true; fi
+  done
+)
+if [ -z "$game_runner" ]; then
+  install_bundle
+  rm -rf "$loader_root/runner" 2>> "$log" || true
+elif install_game_runner; then
+  install_bundle || { echo "game tile not installed" >> "$log" 2>&1 || true; rm -rf "$loader_work"; }
+else
+  rm -rf "$loader_work"
+  show_alert "Couldn't start the game" "NotProton ran into an error. Please check the notproton-run.log in this game's prefix for details."
+  exit 1
+fi
 
 kill_wine_prefix() {
   "$WINESERVER" -k >> "$log" 2>&1 || true
@@ -1865,8 +3078,186 @@ terminate() {
   echo "=== termination signal received, killing wine prefix ===" >> "$log" 2>&1 || true
   kill_wine_prefix
   [ -n "$open_pid" ] && kill "$open_pid" 2>/dev/null || true
+  [ -n "$open_pid" ] || exit 143
 }
+open_pid=""
 trap terminate TERM INT HUP
+
+# What this launch sets itself, which neither a plugin's env nor a NOTPROTON_ENV_ option
+# may replace. One list for both, so the two ways of setting a variable cannot differ.
+np_env_reserved() {
+  case "$1" in
+    (DYLD_* | PATH | HOME | CX_ROOT | CX_HOME | CX_APPLEGPTK_LIBD3DSHARED_PATH | STEAM_COMPAT_* | \
+     STEAM_DYLD_INSERT_LIBRARIES | WINEPREFIX | WINELOADER | WINESERVER | WINEDLLPATH | \
+     WINEDLLOVERRIDES | WINEMSYNC | NOTPROTON_* | UID | EUID | PPID | SHELLOPTS | BASHOPTS)
+      return 0 ;;
+  esac
+  return 1
+}
+
+np_feat_dir="$np_support/plugins"
+np_feat_log() {
+  echo "=== $* ===" >> "$log" 2>&1 || true
+}
+# One reader for plugins and variants alike: the grammar, the limits and every refusal
+# are in np_conf_normalise, and webpatch.c is checked against the same corpus.
+np_conf_feat_table=$(np_conf_normalise "$np_feat_dir" "" plugin) || np_conf_feat_table=""
+np_conf_log "$np_conf_feat_table" plugins
+
+np_feat_first() {
+  np_conf_value "$np_conf_feat_table" "$1" "$2"
+}
+# The first file a plugin names that is actually there; relative ones hang off $HOME.
+np_feat_requires() {
+  np_conf_values "$np_conf_feat_table" "$1" requires | while IFS= read -r np_feat_req; do
+    np_feat_req=$(np_home_path "$np_feat_req")
+    [ -f "$np_feat_req" ] && { printf '%s' "$np_feat_req"; break; }
+  done
+}
+np_feat_installed() {
+  [ -z "$(np_feat_first "$1" requires)" ] || [ -n "$(np_feat_requires "$1")" ]
+}
+np_feat_switched() {
+  eval "np_feat_sv=\${$1-}"
+  if [ -n "$(np_feat_first "$1" type)" ]; then
+    # shellcheck disable=SC2154 # eval assigns np_feat_sv above
+    [ -n "$np_feat_sv" ]
+    return
+  fi
+  np_feat_son=$(np_feat_first "$1" on)
+  [ "$np_feat_sv" = "${np_feat_son:-1}" ]
+}
+# A plugin may name the tools it is for, as a name or a name ending in "*". Naming none
+# means every tool, which is what nearly all of them want.
+np_feat_for_tool() {
+  np_feat_tl=$(np_conf_values "$np_conf_feat_table" "$1" tools)
+  [ -n "$np_feat_tl" ] || return 0
+  while IFS= read -r np_feat_pat; do
+    [ -n "$np_feat_pat" ] || continue
+    # shellcheck disable=SC2254 # the pattern is a glob on purpose, and conf.c keeps it to one *
+    case "$np_tool_name" in
+      ($np_feat_pat) return 0 ;;
+    esac
+  done <<NP_FEAT_TOOLS
+$np_feat_tl
+NP_FEAT_TOOLS
+  return 1
+}
+
+# A row is on only if everything it hangs off is, so a sub-option cannot outlive its parent.
+np_feat_active() {
+  [ "$2" -le 32 ] || return 1
+  np_conf_has "$np_conf_feat_table" "$1" || return 1
+  np_feat_for_tool "$1" || return 1
+  np_feat_switched "$1" || return 1
+  np_feat_installed "$1" || return 1
+  np_feat_adep=$(np_feat_first "$1" depends)
+  [ -z "$np_feat_adep" ] || np_feat_active "$np_feat_adep" $(($2 + 1))
+}
+
+np_feat_list=$(np_conf_ids "$np_conf_feat_table")
+
+np_feat_dylibs=""
+np_feat_envs=""
+while IFS= read -r np_feat_key; do
+  [ -n "$np_feat_key" ] || continue
+  if ! np_feat_installed "$np_feat_key"; then
+    np_feat_switched "$np_feat_key" &&
+      np_feat_log "$np_feat_key is on but is skipped as $np_feat_key's required files are missing"
+    continue
+  fi
+  np_feat_active "$np_feat_key" 0 || continue
+
+  if [ "$(np_feat_first "$np_feat_key" inject)" = 1 ]; then
+    np_feat_lib=$(np_feat_requires "$np_feat_key")
+    if [ ! -f "$np_feat_lib" ]; then
+      np_feat_log "$np_feat_key is skipped as it asks to load a dylib but doesn't name one"
+    elif [ "${np_feat_lib#*:}" != "$np_feat_lib" ]; then
+      np_feat_log "$np_feat_key is skipped as $np_feat_lib has a colon in it"
+    else
+      case ":$np_feat_dylibs:" in
+        (*":$np_feat_lib:"*) ;;
+        (*) np_feat_dylibs="${np_feat_dylibs:+$np_feat_dylibs:}$np_feat_lib"
+            np_feat_log "$np_feat_key will be loaded from $np_feat_lib" ;;
+      esac
+    fi
+  fi
+
+  np_feat_stage=$(np_feat_first "$np_feat_key" stage)
+  if [ -n "$np_feat_stage" ]; then
+    np_feat_stage=$(np_home_path "$np_feat_stage")
+    np_feat_sys32="$WINEPREFIX/drive_c/windows/system32"
+    if [ ! -d "$np_feat_stage" ]; then
+      np_feat_log "$np_feat_key copies no DLLs as $np_feat_stage doesn't exist"
+    elif [ ! -d "$np_feat_sys32" ]; then
+      np_feat_log "$np_feat_key copies no DLLs as the prefix has no system32"
+    else
+      for np_feat_src in "$np_feat_stage"/*; do
+        [ -f "$np_feat_src" ] || continue
+        np_feat_dst="$np_feat_sys32/$(basename "$np_feat_src")"
+        if [ -d "$np_feat_dst" ]; then
+          np_feat_log "$np_feat_key skips $(basename "$np_feat_src") as system32 has a folder by that name"
+          continue
+        fi
+        cmp -s "$np_feat_src" "$np_feat_dst" && continue
+        np_feat_tmp="$np_feat_dst.np-stage.$$"
+        rm -f "$np_feat_tmp"
+        if { cp -c "$np_feat_src" "$np_feat_tmp" 2>/dev/null \
+             || cp "$np_feat_src" "$np_feat_tmp"; } && mv -f "$np_feat_tmp" "$np_feat_dst"; then
+          np_feat_log "$np_feat_key copied $(basename "$np_feat_src") into system32"
+        else
+          rm -f "$np_feat_tmp"
+          np_feat_log "$np_feat_key failed to copy $(basename "$np_feat_src") into system32"
+        fi
+      done
+    fi
+  fi
+
+  np_feat_over=$(np_feat_first "$np_feat_key" overrides)
+  if [ -n "$np_feat_over" ]; then
+    export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+$WINEDLLOVERRIDES;}$np_feat_over"
+    np_feat_log "$np_feat_key adds overrides $np_feat_over"
+  fi
+
+  while IFS= read -r np_feat_env; do
+    [ -n "$np_feat_env" ] || continue
+    case "$np_feat_env" in
+      (*=*) ;;
+      (*) np_feat_log "$np_feat_key skips env line $np_feat_env as it has no ="; continue ;;
+    esac
+    if ! printf '%s\n' "${np_feat_env%%=*}" | LC_ALL=C grep -qx '[A-Z_][A-Z0-9_]*'; then
+      np_feat_log "$np_feat_key skips env ${np_feat_env%%=*} as it isn't a valid variable name"
+      continue
+    fi
+    if np_env_reserved "${np_feat_env%%=*}"; then
+      np_feat_log "$np_feat_key skips env ${np_feat_env%%=*} as the compat_run script sets it"
+      continue
+    fi
+    np_feat_rest=${np_feat_env#*=}
+    # shellcheck disable=SC2088 # a literal tilde is what is being matched
+    case "$np_feat_rest" in
+      ("~/"*) np_feat_rest="\$HOME/${np_feat_rest#"~/"}" ;;
+    esac
+    np_feat_env="${np_feat_env%%=*}="
+    # shellcheck disable=SC2016 # the literal text $HOME is what is being replaced
+    while :; do
+      case "$np_feat_rest" in
+        (*'$HOME'*)
+          np_feat_env="$np_feat_env${np_feat_rest%%'$HOME'*}$HOME"
+          np_feat_rest=${np_feat_rest#*'$HOME'} ;;
+        (*) np_feat_env="$np_feat_env$np_feat_rest"; break ;;
+      esac
+    done
+    # Kept in reverse since they get prepended to open args (which flips the order)
+    np_feat_envs="$np_feat_env
+$np_feat_envs"
+    np_feat_log "$np_feat_key sets $np_feat_env"
+  done <<NP_FEAT_ENV
+$(np_conf_values "$np_conf_feat_table" "$np_feat_key" env)
+NP_FEAT_ENV
+done <<NP_FEAT_LIST
+$np_feat_list
+NP_FEAT_LIST
 
 game_cwd="$(pwd)"
 if [ -n "$STEAM_DYLD_INSERT_LIBRARIES" ]; then
@@ -1874,34 +3265,100 @@ if [ -n "$STEAM_DYLD_INSERT_LIBRARIES" ]; then
 else
   echo "=== client staged no overlay renderer, overlay disabled ===" >> "$log" 2>&1 || true
 fi
-set -- --args "$shim_exe" "$@"
-for name in $(env | LC_ALL=C sed -nE 's/^(CX_APPLEGPTK_LIBD3DSHARED_PATH|Steam[A-Za-z0-9]*|(CX_GRAPHICS|D3DM_|DXMT_|DXVK_|FEX_|MTL_|ROSETTA_)[A-Z0-9_]*)=.*/\1/p'); do
-  eval "value=\$$name"
-  # shellcheck disable=SC2154 # eval assigns value on the line above
-  set -- --env "$name=$value" "$@"
+# Anything this script does not know by name. A launch option NOTPROTON_ENV_FOO=bar gives
+# the game FOO=bar, which is the only per-game way to set one, and Wine and the graphics
+# layers take far more than the prefixes above.
+np_env_passed=$(env | LC_ALL=C sed -nE 's/^NOTPROTON_ENV_([A-Za-z_][A-Za-z0-9_]*)=.*/\1/p' \
+  | LC_ALL=C sort)
+np_env_names=""
+for name in $np_env_passed; do
+  # A row hidden under this tool can't be switched off, so its value stays out too.
+  if np_conf_has "$np_conf_feat_table" "NOTPROTON_ENV_$name" && ! np_feat_for_tool "NOTPROTON_ENV_$name"; then
+    echo "=== NOTPROTON_ENV_$name is not for $np_tool_name, ignored ===" >> "$log" 2>&1 || true
+    continue
+  fi
+  if np_env_reserved "$name"; then
+    echo "=== NOTPROTON_ENV_$name would replace a setting this launch sets itself, ignored ===" \
+      >> "$log" 2>&1 || true
+    continue
+  fi
+  np_env_names="$np_env_names $name"
+  echo "=== NOTPROTON_ENV_$name sets $name ===" >> "$log" 2>&1 || true
 done
-set -- \
-  --env CX_ROOT="$CX_ROOT" \
-  --env CX_HOME="$CX_HOME" \
-  --env WINESERVER="$WINESERVER" \
-  --env WINEDLLPATH="$WINEDLLPATH" \
-  --env WINEDLLOVERRIDES="$WINEDLLOVERRIDES" \
-  --env WINEMSYNC="$WINEMSYNC" \
-  --env WINEPREFIX="$WINEPREFIX" \
-  --env WINEDEBUG="$WINEDEBUG" \
-  --env PATH="$PATH" \
-  --env STEAM_COMPAT_DATA_PATH="$STEAM_COMPAT_DATA_PATH" \
-  --env STEAM_COMPAT_INSTALL_PATH="$STEAM_COMPAT_INSTALL_PATH" \
-  --env STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_COMPAT_CLIENT_INSTALL_PATH" \
-  --env STEAM_COMPAT_APP_ID="$STEAM_COMPAT_APP_ID" \
-  --env STEAM_DYLD_INSERT_LIBRARIES="$STEAM_DYLD_INSERT_LIBRARIES" \
-  --env NOTPROTON_GAME_CWD="$game_cwd" "$@"
-lsregister="/System/Library/Frameworks/CoreServices.framework/Versions/A"
-lsregister="$lsregister/Frameworks/LaunchServices.framework/Support/lsregister"
-[ -x "$lsregister" ] && "$lsregister" -f "$loader_app" >> "$log" 2>&1 || true
-np_started=$(date +%s)
-np_terminated=0
-open -n -W -a "$loader_app" "$@" >> "$log" 2>&1 &
+for launched_app in "$loader_app" ${game_runner:+"$game_app"}; do
+  registered="$loader_root/.launchservices-registered"
+  [ "$launched_app" = "$loader_app" ] || registered="$game_runner/.launchservices-registered"
+  if [ ! -f "$registered" ] || [ "$launched_app/Contents/Info.plist" -nt "$registered" ]; then
+    if [ -x "$lsregister" ] && "$lsregister" -f "$launched_app" >> "$log" 2>&1; then
+      touch "$registered" 2>/dev/null || true
+    fi
+  fi
+done
+if [ -n "$game_runner" ]; then
+  shim="$HOME/Library/Application Support/notproton/overlay-shim.dylib"
+  inserts="$STEAM_DYLD_INSERT_LIBRARIES"
+  if [ -n "$STEAM_DYLD_INSERT_LIBRARIES" ] && [ -f "$shim" ]; then
+    export NOTPROTON_OVERLAY_SHIM="$shim"
+    inserts="$shim:$inserts"
+  fi
+  # FEX's wine ignores DYLD_INSERT_LIBRARIES, lsteamclient loads the overlay there
+  [ "${wine_unix##*/}" = x86_64-unix ] || inserts=""
+  [ -z "$np_feat_dylibs" ] || inserts="${inserts:+$inserts:}$np_feat_dylibs"
+  np_started=$(date +%s)
+  np_terminated=0
+  (unset WINEDLLPATH WINELOADER; [ -z "$inserts" ] || export DYLD_INSERT_LIBRARIES="$inserts"
+   set -- "$game_app/Contents/MacOS/wine" "$shim_exe" "$@"
+   while IFS= read -r np_feat_pair; do
+     [ -z "$np_feat_pair" ] || set -- "$np_feat_pair" "$@"
+   done <<NP_FEAT_PAIRS
+$np_feat_envs
+NP_FEAT_PAIRS
+   for name in $np_env_names; do
+     eval "value=\$NOTPROTON_ENV_$name"
+     set -- "$name=$value" "$@"
+   done
+   # Can't use env here, it drops DYLD_INSERT_LIBRARIES
+   while [ "${1#/}" = "$1" ]; do export "${1?}"; shift; done
+   exec "$@") \
+    > "$loader_root/notproton-wine.log" 2>&1 &
+else
+  set -- --args "$shim_exe" "$@"
+  # Prepended first so they end up last among the --env args since open keeps the last of a repeated name.
+  while IFS= read -r np_feat_env; do
+    [ -n "$np_feat_env" ] && set -- --env "$np_feat_env" "$@"
+  done <<NP_FEAT_ENVS
+$np_feat_envs
+NP_FEAT_ENVS
+  for name in $(env | LC_ALL=C sed -nE 's/^(CX_APPLEGPTK_LIBD3DSHARED_PATH|Steam[A-Za-z0-9]*|(CX_GRAPHICS|D3DM_|DXMT_|DXVK_|FEX_|MTL_|ROSETTA_)[A-Z0-9_]*)=.*/\1/p'); do
+    eval "value=\$$name"
+    # shellcheck disable=SC2154 # eval assigns value on the line above
+    set -- --env "$name=$value" "$@"
+  done
+  for name in $np_env_names; do
+    eval "value=\$NOTPROTON_ENV_$name"
+    set -- --env "$name=$value" "$@"
+  done
+  set -- \
+    --env CX_ROOT="$CX_ROOT" \
+    --env CX_HOME="$CX_HOME" \
+    --env WINESERVER="$WINESERVER" \
+    --env WINEDLLPATH="$WINEDLLPATH" \
+    --env WINEDLLOVERRIDES="$WINEDLLOVERRIDES" \
+    --env WINEMSYNC="$WINEMSYNC" \
+    --env WINEPREFIX="$WINEPREFIX" \
+    --env WINEDEBUG="$WINEDEBUG" \
+    --env PATH="$PATH" \
+    --env STEAM_COMPAT_DATA_PATH="$STEAM_COMPAT_DATA_PATH" \
+    --env STEAM_COMPAT_INSTALL_PATH="$STEAM_COMPAT_INSTALL_PATH" \
+    --env STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_COMPAT_CLIENT_INSTALL_PATH" \
+    --env STEAM_COMPAT_APP_ID="$STEAM_COMPAT_APP_ID" \
+    --env STEAM_DYLD_INSERT_LIBRARIES="$STEAM_DYLD_INSERT_LIBRARIES" \
+    --env NOTPROTON_FEATURE_DYLIBS="$np_feat_dylibs" \
+    --env NOTPROTON_GAME_CWD="$game_cwd" "$@"
+  np_started=$(date +%s)
+  np_terminated=0
+  open -n -W -a "$loader_app" "$@" >> "$log" 2>&1 &
+fi
 open_pid=$!
 /usr/bin/caffeinate -d -i -w "$open_pid" >> "$log" 2>&1 &
 status=0

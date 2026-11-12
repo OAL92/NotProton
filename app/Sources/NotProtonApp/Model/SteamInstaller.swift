@@ -181,6 +181,7 @@ enum SteamInstaller {
 
         report(.registering)
         register(app)
+        GameTiles.refresh(launchers: support.appending(path: "launchers"), run: payload.run)
 
         let landed = SteamBundle.currentInsert(at: plist)
         guard landed == dylib.path(percentEncoded: false) else {
@@ -263,7 +264,9 @@ enum SteamInstaller {
         guard let insert = SteamBundle.currentInsert(at: plist), !insert.isEmpty else { return }
 
         let deployed = dylib.path(percentEncoded: false)
-        let foreign = insert.split(separator: ":").map(String.init).filter { $0 != deployed }
+        let foreign = insert.split(separator: ":").map(String.init).filter {
+            $0 != deployed && URL(filePath: $0).lastPathComponent != SupportPaths.dylibName
+        }
         guard foreign.isEmpty else {
             throw StepFailure(
                 step: step,
